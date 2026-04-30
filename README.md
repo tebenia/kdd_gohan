@@ -103,15 +103,24 @@ Config fields:
 | Field | Meaning |
 | --- | --- |
 | `dataset.root_path` | Root directory of the public demo `input/` dataset. Relative paths are resolved from the project root. |
-| `agent.model` | Model name. |
-| `agent.api_base` | OpenAI-compatible API base URL. |
-| `agent.api_key` | API key, read directly from the config file. |
+| `agent.model` | Model name. Overridden by `MODEL_NAME` when the environment variable is set. |
+| `agent.api_base` | OpenAI-compatible API base URL. Overridden by `MODEL_API_URL` when set. |
+| `agent.api_key` | API key. Overridden by `MODEL_API_KEY` when set; prefer environment variables for secrets. |
 | `agent.max_steps` | Maximum ReAct steps per task. |
 | `agent.temperature` | Sampling temperature. |
 | `run.output_dir` | Output directory for run artifacts. |
 | `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Must be a single directory name; existing run directories are rejected. |
 | `run.max_workers` | Parallel worker count for `run-benchmark`. |
 | `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
+
+For local testing with environment variables:
+
+```bash
+export MODEL_NAME="qwen3.5-35b-a3b"
+export MODEL_API_URL="https://your-openai-compatible-endpoint/v1"
+export MODEL_API_KEY="your-api-key"
+uv run dabench run-task task_11 --config configs/react_baseline.example.yaml
+```
 
 ## CLI
 

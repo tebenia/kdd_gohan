@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,6 +55,14 @@ def _path_value(raw_value: str | None, default_value: Path) -> Path:
     return (PROJECT_ROOT / candidate).resolve()
 
 
+def _env_value(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def load_app_config(config_path: Path) -> AppConfig:
     payload = yaml.safe_load(config_path.read_text()) or {}
     dataset_defaults = DatasetConfig()
@@ -68,9 +77,11 @@ def load_app_config(config_path: Path) -> AppConfig:
         root_path=_path_value(dataset_payload.get("root_path"), dataset_defaults.root_path),
     )
     agent_config = AgentConfig(
-        model=str(agent_payload.get("model", agent_defaults.model)),
-        api_base=str(agent_payload.get("api_base", agent_defaults.api_base)),
-        api_key=str(agent_payload.get("api_key", agent_defaults.api_key)),
+        model=_env_value("MODEL_NAME") or str(agent_payload.get("model", agent_defaults.model)),
+        api_base=_env_value("MODEL_API_URL")
+        or str(agent_payload.get("api_base", agent_defaults.api_base)),
+        api_key=_env_value("MODEL_API_KEY")
+        or str(agent_payload.get("api_key", agent_defaults.api_key)),
         max_steps=int(agent_payload.get("max_steps", agent_defaults.max_steps)),
         temperature=float(agent_payload.get("temperature", agent_defaults.temperature)),
     )
@@ -84,6 +95,8 @@ def load_app_config(config_path: Path) -> AppConfig:
         output_dir=_path_value(run_payload.get("output_dir"), run_defaults.output_dir),
         run_id=run_id,
         max_workers=int(run_payload.get("max_workers", run_defaults.max_workers)),
-        task_timeout_seconds=int(run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)),
+        task_timeout_seconds=int(
+            run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)
+        ),
     )
     return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config)

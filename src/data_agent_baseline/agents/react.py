@@ -55,6 +55,11 @@ def parse_model_step(raw_response: str) -> ModelStep:
         raise ValueError("thought must be a string.")
     if not isinstance(action, str) or not action:
         raise ValueError("action must be a non-empty string.")
+    # Auto-repair: some models emit action_input as a bare code string
+    # for execute_python instead of {"code": "..."}. Normalize that here
+    # so we don't waste steps on a purely structural mistake.
+    if action == "execute_python" and isinstance(action_input, str):
+        action_input = {"code": action_input}
     if not isinstance(action_input, dict):
         raise ValueError("action_input must be a JSON object.")
 

@@ -28,6 +28,11 @@ Example response when you need to inspect the context:
 {"thought":"I should inspect the available files first.","action":"list_context","action_input":{"max_depth":4}}
 ```
 
+Example response when you need to run Python code (note action_input is an object with a "code" key, NOT a bare string):
+```json
+{"thought":"Let me compute the answer with pandas.","action":"execute_python","action_input":{"code":"import pandas as pd\ndf = pd.read_csv('data.csv')\nprint(df.head())"}}
+```
+
 Example response when you have the final answer:
 ```json
 {"thought":"I have the final result table.","action":"answer","action_input":{"columns":["average_long_shots"],"rows":[["63.5"]]}}

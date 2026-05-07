@@ -19,6 +19,13 @@ Rules:
 6. Always wrap that JSON object in exactly one fenced code block that starts with ```json and ends with ```.
 7. Do not output any text before or after the fenced JSON block.
 
+Structured-data accuracy rules:
+- For CSV/JSON/SQLite tasks, compute from the full dataset with SQL or Python; do not answer from preview rows alone.
+- Use `inspect_context_tables` and `execute_context_duckdb` for CSV/JSON joins, filters, grouping, sorting, and tie handling.
+- Return every matching row unless the question explicitly asks for one result or a top-1 result.
+- Preserve raw numeric precision and raw time/date strings unless the question asks for rounding or formatting.
+- Return only the requested fields. If a full name is stored as `first_name` and `last_name`, return those source fields separately unless a literal full-name field exists.
+
 Keep reasoning concise and grounded in the observed data.
 """.strip()
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
+from data_agent_baseline.tools.duckdb import execute_context_duckdb_sql, inspect_context_tables
 from data_agent_baseline.tools.filesystem import (
     list_context_tree,
     read_csv_preview,
@@ -68,6 +69,19 @@ def _execute_context_sql(task: PublicTask, action_input: dict[str, Any]) -> Tool
     sql = str(action_input["sql"])
     limit = int(action_input.get("limit", 200))
     return ToolExecutionResult(ok=True, content=execute_read_only_sql(path, sql, limit=limit))
+
+
+def _inspect_context_tables(task: PublicTask, _: dict[str, Any]) -> ToolExecutionResult:
+    return ToolExecutionResult(ok=True, content=inspect_context_tables(task.context_dir))
+
+
+def _execute_context_duckdb(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+    sql = str(action_input["sql"])
+    limit = int(action_input.get("limit", 200))
+    return ToolExecutionResult(
+        ok=True,
+        content=execute_context_duckdb_sql(task.context_dir, sql, limit=limit),
+    )
 
 
 def _execute_python(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
@@ -143,6 +157,15 @@ def create_default_tool_registry() -> ToolRegistry:
             description="Run a read-only SQL query against a sqlite/db file inside context.",
             input_schema={"path": "relative/path/to/file.sqlite", "sql": "SELECT ...", "limit": 200},
         ),
+        "execute_context_duckdb": ToolSpec(
+            name="execute_context_duckdb",
+            description=(
+                "Run a read-only DuckDB SQL query over all CSV files and JSON files with "
+                "`records` inside context. Use inspect_context_tables first to see table "
+                "names, columns, and row counts. This queries full files, not previews."
+            ),
+            input_schema={"sql": "SELECT ... FROM table_name", "limit": 200},
+        ),
         "execute_python": ToolSpec(
             name="execute_python",
             description=(
@@ -158,6 +181,14 @@ def create_default_tool_registry() -> ToolRegistry:
             name="inspect_sqlite_schema",
             description="Inspect tables and columns in a sqlite/db file inside context.",
             input_schema={"path": "relative/path/to/file.sqlite"},
+        ),
+        "inspect_context_tables": ToolSpec(
+            name="inspect_context_tables",
+            description=(
+                "Inspect all CSV files and JSON record files in context as SQL-queryable "
+                "tables, including table names, columns, row counts, and source paths."
+            ),
+            input_schema={},
         ),
         "list_context": ToolSpec(
             name="list_context",
@@ -182,8 +213,10 @@ def create_default_tool_registry() -> ToolRegistry:
     }
     handlers = {
         "answer": _answer,
+        "execute_context_duckdb": _execute_context_duckdb,
         "execute_context_sql": _execute_context_sql,
         "execute_python": _execute_python,
+        "inspect_context_tables": _inspect_context_tables,
         "inspect_sqlite_schema": _inspect_sqlite_schema,
         "list_context": _list_context,
         "read_csv": _read_csv,

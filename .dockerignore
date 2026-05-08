@@ -1,0 +1,30 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.ipynb_checkpoints
+
+# Local-only data, outputs, secrets, and experiments.
+artifacts
+data
+docs
+evaluation
+tests
+configs/*.local.yaml
+configs/*local*.yaml
+.env
+.env.*
+.codex
+*.ipynb
+
+# Local scratch/copy files.
+* copy.py
+*-tb.py
+*-ferry.py

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import multiprocessing
 import os
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty
 from time import perf_counter
 from typing import Any
 
@@ -33,6 +35,7 @@ class SubmissionConfig:
     model_api_key: str
     max_steps: int
     max_workers: int
+    task_timeout_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +75,7 @@ def load_submission_config() -> SubmissionConfig:
         model_api_key=os.environ.get("MODEL_API_KEY", "EMPTY").strip() or "EMPTY",
         max_steps=_env_int("AGENT_MAX_STEPS", 16),
         max_workers=max(_env_int("SUBMISSION_MAX_WORKERS", 1), 1),
+        task_timeout_seconds=_env_int("SUBMISSION_TASK_TIMEOUT_SECONDS", 600),
     )
 
 
@@ -159,7 +163,7 @@ def write_empty_prediction(output_root: Path, task_id: str) -> Path:
     return prediction_path
 
 
-def process_task(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResult:
+def process_task_core(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResult:
     started_at = perf_counter()
     task_id = task_dir.name
     try:
@@ -195,6 +199,83 @@ def process_task(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResu
         )
 
 
+def process_task_in_subprocess(
+    task_dir: str,
+    config: SubmissionConfig,
+    queue: multiprocessing.Queue[Any],
+) -> None:
+    if hasattr(os, "setsid"):
+        os.setsid()
+    result = process_task_core(Path(task_dir), config)
+    queue.put(asdict(result))
+
+
+def terminate_task_process(process: multiprocessing.Process) -> None:
+    if process.pid and hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            process.terminate()
+    else:
+        process.terminate()
+
+    process.join(timeout=1.0)
+    if process.is_alive():
+        if process.pid and hasattr(os, "killpg"):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.kill()
+        else:
+            process.kill()
+        process.join()
+
+
+def process_task(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResult:
+    timeout_seconds = config.task_timeout_seconds
+    if timeout_seconds <= 0:
+        return process_task_core(task_dir, config)
+
+    started_at = perf_counter()
+    task_id = task_dir.name
+    queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
+    process = multiprocessing.Process(
+        target=process_task_in_subprocess,
+        args=(task_dir.as_posix(), config, queue),
+    )
+    process.start()
+    process.join(timeout_seconds)
+
+    if process.is_alive():
+        terminate_task_process(process)
+        prediction_path = write_empty_prediction(config.output_root, task_id)
+        return SubmissionTaskResult(
+            task_id=task_id,
+            succeeded=False,
+            prediction_path=str(prediction_path),
+            elapsed_seconds=round(perf_counter() - started_at, 3),
+            failure_reason=f"Task timed out after {timeout_seconds} seconds.",
+        )
+
+    try:
+        payload = queue.get(timeout=1.0)
+    except Empty:
+        prediction_path = write_empty_prediction(config.output_root, task_id)
+        return SubmissionTaskResult(
+            task_id=task_id,
+            succeeded=False,
+            prediction_path=str(prediction_path),
+            elapsed_seconds=round(perf_counter() - started_at, 3),
+            failure_reason=f"Task exited without returning a result (exit_code={process.exitcode}).",
+        )
+
+    return SubmissionTaskResult(**payload)
+
+
 def write_summary(log_root: Path, payload: dict[str, Any]) -> None:
     log_root.mkdir(parents=True, exist_ok=True)
     summary_path = log_root / "summary.json"
@@ -206,7 +287,8 @@ def run_submission(config: SubmissionConfig) -> int:
     print(
         f"[{datetime.now(timezone.utc).isoformat()}] "
         f"Starting submission run input={config.input_root} output={config.output_root} "
-        f"model={config.model_name} max_steps={config.max_steps} max_workers={config.max_workers}",
+        f"model={config.model_name} max_steps={config.max_steps} "
+        f"max_workers={config.max_workers} task_timeout_seconds={config.task_timeout_seconds}",
         flush=True,
     )
     task_dirs = iter_task_dirs(config.input_root)

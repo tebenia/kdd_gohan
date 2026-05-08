@@ -33,7 +33,13 @@ def _strip_json_fence(raw_response: str) -> str:
 
 
 def _load_single_json_object(text: str) -> dict[str, object]:
-    payload, end = json.JSONDecoder().raw_decode(text)
+    try:
+        payload, end = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON format. Did you forget to escape newlines as \\\\n or double quotes as \\\\\"? "
+            f"Error details: {exc}"
+        ) from exc
     remainder = text[end:].strip()
     if remainder:
         cleaned_remainder = re.sub(r"(?:\\[nrt])+", "", remainder).strip()
@@ -55,11 +61,13 @@ def parse_model_step(raw_response: str) -> ModelStep:
         raise ValueError("thought must be a string.")
     if not isinstance(action, str) or not action:
         raise ValueError("action must be a non-empty string.")
-    # Auto-repair: some models emit action_input as a bare code string
-    # for execute_python instead of {"code": "..."}. Normalize that here
-    # so we don't waste steps on a purely structural mistake.
-    if action == "execute_python" and isinstance(action_input, str):
-        action_input = {"code": action_input}
+
+    if isinstance(action_input, str):
+        if action == "execute_python":
+            action_input = {"code": action_input}
+        elif action == "execute_context_sql":
+            action_input = {"sql": action_input}
+
     if not isinstance(action_input, dict):
         raise ValueError("action_input must be a JSON object.")
 

@@ -29,6 +29,8 @@ tests/
 evaluation/
 artifacts/*
 !artifacts/.gitkeep
+tmp_submission_test
+*.tar.gz
 
 # Local configs
 configs/*

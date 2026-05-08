@@ -18,13 +18,8 @@ Rules:
 5. Always return exactly one JSON object with keys `thought`, `action`, and `action_input`.
 6. Always wrap that JSON object in exactly one fenced code block that starts with ```json and ends with ```.
 7. Do not output any text before or after the fenced JSON block.
-
-Structured-data accuracy rules:
-- For CSV/JSON/SQLite tasks, compute from the full dataset with SQL or Python; do not answer from preview rows alone.
-- Use `inspect_context_tables` and `execute_context_duckdb` for CSV/JSON joins, filters, grouping, sorting, and tie handling.
-- Return every matching row unless the question explicitly asks for one result or a top-1 result.
-- Preserve raw numeric precision and raw time/date strings unless the question asks for rounding or formatting.
-- Return only the requested fields. If a full name is stored as `first_name` and `last_name`, return those source fields separately unless a literal full-name field exists.
+8. For efficiency, strictly prefer using `sqlite3` for .db files and `pandas` for .csv/.json files rather than writing raw Python loops.
+9. ALWAYS ensure your JSON is valid. Escape newlines (`\\n`) and double quotes (`\\"`) properly inside JSON strings.
 
 Keep reasoning concise and grounded in the observed data.
 """.strip()
@@ -35,9 +30,9 @@ Example response when you need to inspect the context:
 {"thought":"I should inspect the available files first.","action":"list_context","action_input":{"max_depth":4}}
 ```
 
-Example response when you need to run Python code (note action_input is an object with a "code" key, NOT a bare string):
+Example response when you need to run Python code:
 ```json
-{"thought":"Let me compute the answer with pandas.","action":"execute_python","action_input":{"code":"import pandas as pd\ndf = pd.read_csv('data.csv')\nprint(df.head())"}}
+{"thought":"I need to query the data using pandas.","action":"execute_python","action_input":{"code":"import pandas as pd\\ndf = pd.read_csv('context/data.csv')\\nprint(df.head())"}}
 ```
 
 Example response when you have the final answer:

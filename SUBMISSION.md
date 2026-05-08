@@ -25,6 +25,8 @@ Model configuration is read only from runtime environment variables:
 MODEL_API_URL
 MODEL_API_KEY
 MODEL_NAME
+SUBMISSION_MAX_WORKERS
+SUBMISSION_TASK_TIMEOUT_SECONDS
 ```
 
 Local-only data, artifacts, notebooks, virtual environments, and local config files are excluded by `.dockerignore`.
@@ -60,7 +62,8 @@ Set your local model endpoint first:
 export MODEL_API_URL="https://your-openai-compatible-endpoint/v1"
 export MODEL_API_KEY="your-api-key"
 export MODEL_NAME="qwen3.5-35b-a3b"
-export SUBMISSION_MAX_WORKERS=1
+export SUBMISSION_MAX_WORKERS=8
+export SUBMISSION_TASK_TIMEOUT_SECONDS=600
 ```
 
 Run:
@@ -70,6 +73,8 @@ Run:
 ```
 
 The script mounts local public demo input into `/input`, writes predictions under `tmp_submission_test/output`, and logs under `tmp_submission_test/logs`.
+
+Each task runs in a child process. If a task exceeds `SUBMISSION_TASK_TIMEOUT_SECONDS`, the process is stopped and an empty `prediction.csv` is written for that task so the remaining tasks can continue.
 
 ## Email Submission
 

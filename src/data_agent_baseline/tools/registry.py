@@ -146,7 +146,13 @@ def create_default_tool_registry() -> ToolRegistry:
     specs = {
         "answer": ToolSpec(
             name="answer",
-            description="Submit the final answer table. This is the only valid terminating action.",
+            description=(
+                "Submit the final answer table. This is the only valid terminating action. "
+                "Return only the columns directly requested by the question; omit proof, helper, "
+                "filtering, sorting, ranking, join-key, and calculation columns unless explicitly "
+                "asked for them. If a column was only needed to find the answer, do not include it "
+                "in the final answer table."
+            ),
             input_schema={
                 "columns": ["column_name"],
                 "rows": [["value_1"]],

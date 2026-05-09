@@ -30,6 +30,14 @@ Answer-table schema rules:
 - If multiple rows tie for a lowest or highest value, return all tied rows, but still only with the requested output columns.
 - Preserve raw numeric precision and raw time/date strings unless the question asks for rounding or formatting.
 
+Final answer projection rules:
+- SQL/Python may select extra columns internally to filter, join, sort, rank, or compute results, but the final `answer` table must project away those internal columns.
+- For "Which <entity> has the lowest/highest/minimum/maximum <metric>?" questions, compute the metric internally, include every tied entity at the min/max value, then answer only the entity column(s), not the metric column.
+- Do not use `LIMIT 1` for lowest/highest/minimum/maximum questions unless the question explicitly asks for exactly one row. Prefer computing the min/max value first, then selecting all rows equal to that value.
+- For "List all <records/entities> that satisfy a condition" questions, answer only the identifier/name column(s) of the requested records/entities.
+- Columns used only to prove the answer, such as `cost`, `amount`, `date`, `type`, `operation`, `account_id`, or `balance`, must be omitted unless the question explicitly asks for those fields.
+- Before calling `answer`, check each output column: if removing the column would still answer the question, remove it.
+
 Keep reasoning concise and grounded in the observed data.
 """.strip()
 
@@ -48,6 +56,19 @@ Example response when you have the final answer:
 ```json
 {"thought":"I have the final result table.","action":"answer","action_input":{"columns":["average_long_shots"],"rows":[["63.5"]]}}
 ```
+
+Example final projection for a lowest-cost question:
+- Question: Which event has the lowest cost?
+- Bad query pattern: ORDER BY cost ASC LIMIT 1
+- Good query pattern: find MIN(cost), then return all events whose cost equals that minimum
+- Bad answer columns: ["event_name", "cost"]
+- Good answer columns: ["event_name"]
+- Good answer rows: every event tied at the minimum cost
+
+Example final projection for listing cash withdrawals:
+- Question: List all the withdrawals in cash transactions that the client with the id 3356 makes.
+- Bad answer columns: ["trans_id", "account_id", "date", "type", "operation", "amount", "balance"]
+- Good answer columns: ["trans_id"]
 """.strip()
 
 

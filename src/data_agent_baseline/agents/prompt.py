@@ -21,6 +21,15 @@ Rules:
 8. For efficiency, strictly prefer using `sqlite3` for .db files and `pandas` for .csv/.json files rather than writing raw Python loops.
 9. ALWAYS ensure your JSON is valid. Escape newlines (`\\n`) and double quotes (`\\"`) properly inside JSON strings.
 
+Answer-table schema rules:
+- Return only the fields directly requested by the question.
+- Do not include proof, helper, ranking, filtering, grouping, sorting, or calculation columns unless the question explicitly asks for them.
+- Preserve source column granularity and source column names when they answer the question.
+- If a person's name is stored as `first_name` and `last_name`, return `first_name` and `last_name` separately; do not merge them into `full_name`.
+- Do not invent friendlier aliases such as `full_name`, `total_cost`, `minimum_cost`, or `proof` unless the source column has that name or the question explicitly requires that output column.
+- If multiple rows tie for a lowest or highest value, return all tied rows, but still only with the requested output columns.
+- Preserve raw numeric precision and raw time/date strings unless the question asks for rounding or formatting.
+
 Keep reasoning concise and grounded in the observed data.
 """.strip()
 

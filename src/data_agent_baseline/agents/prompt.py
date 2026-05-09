@@ -38,6 +38,16 @@ Final answer projection rules:
 - Columns used only to prove the answer, such as `cost`, `amount`, `date`, `type`, `operation`, `account_id`, or `balance`, must be omitted unless the question explicitly asks for those fields.
 - Before calling `answer`, check each output column: if removing the column would still answer the question, remove it.
 
+Precision matching rules:
+- If the question gives a value at lower precision than the data, return all rows matching the stated precision; do not choose only the closest row.
+- For time values, `0:01:54`, `00:01:54`, and `1:54` refer to the minute and second. Values like `1:54.455` and `1:54.960` both match that stated precision.
+- Only choose a single nearest or closest value when the question explicitly asks for nearest, closest, first, top, best, or one result.
+
+Entity attribute disambiguation rules:
+- When the question asks for an attribute "of the <entity>" (for example, a driver's number, code, name, nationality, or date of birth), return that attribute from the entity/master table after joining through the entity id.
+- If a fact/event table and an entity/master table share a column name, do not assume the fact/event table column is the requested entity attribute.
+- For Formula 1 driver questions, `drivers.number` is the driver's official number. Columns such as `qualifying.number` or `results.number` are session/race entry numbers and should only be used when the question explicitly asks for the qualifying, result, car, grid, or race entry number.
+
 Keep reasoning concise and grounded in the observed data.
 """.strip()
 
@@ -69,6 +79,18 @@ Example final projection for listing cash withdrawals:
 - Question: List all the withdrawals in cash transactions that the client with the id 3356 makes.
 - Bad answer columns: ["trans_id", "account_id", "date", "type", "operation", "amount", "balance"]
 - Good answer columns: ["trans_id"]
+
+Example precision matching for time values:
+- Question: What is the number of the driver who finished 0:01:54 in Q3?
+- Data values: 1:54.455 and 1:54.960
+- Bad behavior: choose only the closest time
+- Good behavior: return both rows because both match 1 minute 54 seconds
+
+Example entity attribute disambiguation:
+- Question: What is the number of the driver who finished 0:01:54 in Q3?
+- Bad query pattern: SELECT number FROM qualifying WHERE raceId = 903 AND q3 LIKE '1:54%'
+- Good query pattern: SELECT drivers.number FROM qualifying JOIN drivers ON qualifying.driverId = drivers.driverId WHERE qualifying.raceId = 903 AND qualifying.q3 LIKE '1:54%'
+- Good behavior: use qualifying to find the matching driver rows, then return the driver number from drivers
 """.strip()
 
 

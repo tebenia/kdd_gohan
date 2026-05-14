@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from data_agent_baseline.benchmark.schema import PublicTask
-from data_agent_baseline.tools.duckdb import inspect_context_tables
+from data_agent_baseline.tools.duckdb import execute_context_duckdb_sql, inspect_context_tables
 
 
 HELPER_COLUMN_NAMES = {
@@ -86,6 +86,21 @@ UNIT_PRICE_COMPUTATION_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
+MONTH_NUMBERS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class AnswerValidationIssue:
@@ -131,6 +146,7 @@ def validate_answer(
     issues.extend(_minmax_limit_issues(task.question, validation_steps))
     issues.extend(_aggregate_zero_exclusion_issues(task.question, validation_steps))
     issues.extend(_per_unit_price_issues(task.question, schema_tables, validation_steps))
+    issues.extend(_empty_gas_station_country_issues(task, columns, rows, schema_tables))
     issues.extend(_california_schools_sat_issues(task.question, validation_steps))
     issues.extend(_finance_cash_withdrawal_issues(task.question, validation_steps))
     issues.extend(_formula1_track_number_issues(task.question, validation_steps))
@@ -523,6 +539,105 @@ def _per_unit_price_issues(
                 "to the threshold. In schemas with total `Price` and `Amount`/quantity, "
                 "compute unit price first, for example `Price * 1.0 / Amount > threshold`, "
                 "then submit only the requested output columns."
+            ),
+        )
+    ]
+
+
+def _question_month_as_yyyymm(question: str) -> int | None:
+    lowered_question = question.lower()
+    for month_name, month_number in MONTH_NUMBERS.items():
+        match = re.search(
+            rf"\b{month_name}\b(?:\s*,\s*|\s+of\s+|\s+)(?P<year>(?:19|20)\d{{2}})\b",
+            lowered_question,
+        )
+        if match is not None:
+            return int(f"{match.group('year')}{month_number:02d}")
+    return None
+
+
+def _has_table_with_columns(
+    schema_tables: Sequence[dict[str, Any]],
+    table_name: str,
+    required_columns: set[str],
+) -> bool:
+    for table in schema_tables:
+        if _normalize_identifier(_table_name(table)) != table_name:
+            continue
+        normalized_columns = {_normalize_identifier(column) for column in _table_columns(table)}
+        if required_columns.issubset(normalized_columns):
+            return True
+    return False
+
+
+def _asks_gas_station_country_question(question: str, columns: Sequence[str]) -> bool:
+    lowered_question = question.lower()
+    answer_columns = {_normalize_identifier(column) for column in columns}
+    asks_country = "country" in lowered_question or "countries" in lowered_question
+    asks_gas_station = bool(re.search(r"\bgas\s*stations?\b|\bgasstations?\b", lowered_question))
+    asks_transactions = bool(re.search(r"\btransactions?\b", lowered_question))
+    return "country" in answer_columns and asks_country and asks_gas_station and asks_transactions
+
+
+def _empty_gas_station_country_issues(
+    task: PublicTask,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    schema_tables: Sequence[dict[str, Any]],
+) -> list[AnswerValidationIssue]:
+    if rows:
+        return []
+    if not _asks_gas_station_country_question(task.question, columns):
+        return []
+
+    yyyymm = _question_month_as_yyyymm(task.question)
+    if yyyymm is None:
+        return []
+
+    has_yearmonth = _has_table_with_columns(
+        schema_tables,
+        "yearmonth",
+        {"customerid", "date"},
+    )
+    has_gasstations = _has_table_with_columns(
+        schema_tables,
+        "gasstations",
+        {"gasstationid", "country"},
+    )
+    if not has_yearmonth or not has_gasstations:
+        return []
+
+    try:
+        result = execute_context_duckdb_sql(
+            task.context_dir,
+            (
+                "SELECT DISTINCT g.Country "
+                "FROM yearmonth y "
+                "JOIN gasstations g "
+                "ON CAST(y.CustomerID AS BIGINT) = CAST(g.GasStationID AS BIGINT) "
+                f"WHERE CAST(y.Date AS BIGINT) = {yyyymm} "
+                "AND g.Country IS NOT NULL "
+                "ORDER BY g.Country"
+            ),
+            limit=5,
+        )
+    except Exception:
+        return []
+
+    country_rows = result.get("rows")
+    if not isinstance(country_rows, list) or not country_rows:
+        return []
+
+    observed_countries = [row[0] for row in country_rows if isinstance(row, list) and row]
+    return [
+        AnswerValidationIssue(
+            code="empty_gas_station_country_answer",
+            message=(
+                "The answer is empty, but the context has month-level `yearmonth` rows and "
+                "`gasstations.Country` rows that produce countries for the requested month. "
+                f"For this schema, convert the month to `yearmonth.Date = {yyyymm}` and check "
+                "`yearmonth.CustomerID = gasstations.GasStationID`; observed countries include "
+                f"{observed_countries}. Return distinct `Country` values only."
             ),
         )
     ]

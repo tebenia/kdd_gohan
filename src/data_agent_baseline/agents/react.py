@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
+import threading
 from dataclasses import dataclass
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage, ModelStep
@@ -14,6 +17,23 @@ from data_agent_baseline.agents.prompt import (
 from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState, StepRecord
 from data_agent_baseline.benchmark.schema import PublicTask
 from data_agent_baseline.tools.registry import ToolExecutionContext, ToolRegistry
+
+_SIGALRM_SUPPORTED = hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
+
+
+class _StepTimeoutError(TimeoutError):
+    pass
+
+
+def _alarm_handler(_signum: int, _frame: object) -> None:
+    raise _StepTimeoutError("Model API call timed out.")
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return float(value.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +112,7 @@ class ReActAgent:
         self.tools = tools
         self.config = config or ReActAgentConfig()
         self.system_prompt = system_prompt or REACT_SYSTEM_PROMPT
+        self.step_timeout_seconds = max(_env_float("AGENT_STEP_TIMEOUT_SECONDS", 60.0), 0.0)
 
     def _build_messages(self, task: PublicTask, state: AgentRuntimeState) -> list[ModelMessage]:
         system_content = build_system_prompt(
@@ -107,11 +128,57 @@ class ReActAgent:
             )
         return messages
 
+    def _complete_with_timeout(self, messages: list[ModelMessage]) -> str:
+        if self.step_timeout_seconds <= 0:
+            return self.model.complete(messages)
+
+        if _SIGALRM_SUPPORTED and threading.current_thread() is threading.main_thread():
+            previous_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.setitimer(signal.ITIMER_REAL, self.step_timeout_seconds)
+            try:
+                return self.model.complete(messages)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                signal.signal(signal.SIGALRM, previous_handler)
+
+        result: list[str] = []
+        errors: list[BaseException] = []
+
+        def call_model() -> None:
+            try:
+                result.append(self.model.complete(messages))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        thread = threading.Thread(target=call_model, daemon=True)
+        thread.start()
+        thread.join(timeout=self.step_timeout_seconds)
+        if thread.is_alive():
+            raise _StepTimeoutError("Model API call timed out.")
+        if errors:
+            raise errors[0]
+        if not result:
+            raise RuntimeError("Model request ended without returning a response.")
+        return result[0]
+
+    @staticmethod
+    def _has_consecutive_timeouts(state: AgentRuntimeState, count: int = 3) -> bool:
+        if len(state.steps) < count:
+            return False
+        recent_steps = state.steps[-count:]
+        return all(
+            step.action == "__error__"
+            and "timed out" in str(step.observation.get("error", "")).lower()
+            for step in recent_steps
+        )
+
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
         for step_index in range(1, self.config.max_steps + 1):
-            raw_response = self.model.complete(self._build_messages(task, state))
+            raw_response = ""
             try:
+                raw_response = self._complete_with_timeout(self._build_messages(task, state))
                 model_step = parse_model_step(raw_response)
                 tool_result = self.tools.execute(
                     task,
@@ -153,6 +220,9 @@ class ReActAgent:
                         ok=False,
                     )
                 )
+                if self._has_consecutive_timeouts(state):
+                    state.failure_reason = "Agent aborted: 3 consecutive model timeouts."
+                    break
 
         if state.answer is None and state.failure_reason is None:
             state.failure_reason = "Agent did not submit an answer within max_steps."

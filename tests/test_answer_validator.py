@@ -539,6 +539,62 @@ class AnswerValidatorTests(unittest.TestCase):
 
         self.assertIn("consumption_status_extra_customer_id", _issue_codes(issues))
 
+    def test_rejects_empty_gas_station_country_answer_when_month_join_has_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Please list the countries of the gas stations with transactions taken place in June, 2013.",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "yearmonth.csv",
+                [
+                    {"CustomerID": 44, "Date": 201306, "Consumption": 10.0},
+                    {"CustomerID": 45, "Date": 201306, "Consumption": 12.0},
+                    {"CustomerID": 999, "Date": 201305, "Consumption": 5.0},
+                ],
+            )
+            _write_json_records(
+                task.context_dir / "json" / "gasstations.json",
+                "gasstations",
+                [
+                    {"GasStationID": 44, "Country": "CZE", "Segment": "Value for money"},
+                    {"GasStationID": 45, "Country": "SVK", "Segment": "Premium"},
+                    {"GasStationID": 999, "Country": "AUT", "Segment": "Other"},
+                ],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["Country"],
+                rows=[],
+            )
+
+        self.assertIn("empty_gas_station_country_answer", _issue_codes(issues))
+
+    def test_accepts_non_empty_gas_station_country_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Please list the countries of the gas stations with transactions taken place in June, 2013.",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "yearmonth.csv",
+                [{"CustomerID": 44, "Date": 201306, "Consumption": 10.0}],
+            )
+            _write_json_records(
+                task.context_dir / "json" / "gasstations.json",
+                "gasstations",
+                [{"GasStationID": 44, "Country": "CZE", "Segment": "Value for money"}],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["Country"],
+                rows=[["CZE"]],
+            )
+
+        self.assertNotIn("empty_gas_station_country_answer", _issue_codes(issues))
+
     def test_rejects_california_school_answer_without_sat_math_filter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             task = _task(

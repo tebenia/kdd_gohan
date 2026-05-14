@@ -55,8 +55,6 @@ Full-data and dataset-specific semantic rules:
 - When a question asks for descriptive fields from one table but filters by a metric from another table, keep the metric table joined/merged through the final row set. Do not answer from the descriptive table alone after identifying a broad candidate group.
 - When a transaction question says "per unit", "unit price", or "paid more than X per unit", do not compare against a total transaction price directly. If the schema has total `Price` and unit count `Amount`/`Quantity`, compute unit price as `Price / Amount` or `Price / Quantity` before filtering.
 - When a question says "give their consumption status" after defining a group of people/customers, return the consumption/status column only. Do not include `CustomerID` unless the question explicitly asks to identify customer ids.
-- In the Debit Card dataset, `yearmonth.Date` uses integer `YYYYMM` values. For month questions, convert months such as June 2013 to `201306`. If `transactions_1k.db` does not cover the requested month, do not keep forcing that sample transaction table; use the available month-level table and related context tables instead.
-- For Debit Card gas-station country questions, return distinct `gasstations.Country` values only. Do not include gas station ids, customers, counts, or proof columns unless explicitly requested.
 - In California schools tasks, if the condition mentions SAT math score, use `satscores.AvgScrMath` from `satscores` and join/merge it to `frpm.CDSCode` when returning `School Name` or `Charter Funding Type`. For school lists, use school-level SAT rows (`rtype = 'S'`) and enforce the score threshold before the final answer.
 - In the finance transaction dataset, "cash withdrawals" means `trans.operation = 'VYBER'`. Do not include `VYBER KARTOU` unless the question explicitly asks for card withdrawals, and do not add a `k_symbol` filter unless the question mentions that field/category.
 - For Formula 1 questions like "Which race was Alex Yoong in when he was in track number less than 20?", use `driverstandings.position < 20`, not `races.round < 20`.
@@ -126,12 +124,6 @@ Example per-unit transaction filtering:
 - Bad query pattern: SELECT DISTINCT CustomerID FROM transactions WHERE ProductID = 5 AND Price > 29.00
 - Good query pattern: SELECT DISTINCT CustomerID FROM transactions WHERE ProductID = 5 AND Price * 1.0 / Amount > 29.00
 - Good answer columns: ["Consumption"]
-
-Example Debit Card month and gas-station country semantics:
-- Question: Please list the countries of the gas stations with transactions taken place in June, 2013.
-- Bad behavior: keep querying `transactions_1k.db` after observing that its date range does not cover June 2013
-- Good behavior: use `yearmonth.Date = 201306` for the requested month, use the available `gasstations` context for country values, and return distinct countries
-- Good answer columns: ["Country"]
 
 Example finance cash withdrawal semantics:
 - Question: List all the withdrawals in cash transactions that the client with the id 3356 makes.

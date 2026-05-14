@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import httpx
 from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 
 try:  # OpenAI SDK versions differ slightly on exported error classes.
@@ -92,6 +93,7 @@ class OpenAIModelAdapter:
         temperature: float,
         max_retries: int | None = None,
         retry_base_delay_seconds: float | None = None,
+        request_timeout_seconds: float | None = None,
     ) -> None:
         self.model = model
         self.api_base = api_base.rstrip("/")
@@ -107,14 +109,30 @@ class OpenAIModelAdapter:
             else _env_float("MODEL_RETRY_BASE_DELAY_SECONDS", 1.0),
             0.0,
         )
+        self.request_timeout_seconds = max(
+            request_timeout_seconds
+            if request_timeout_seconds is not None
+            else _env_float("MODEL_REQUEST_TIMEOUT_SECONDS", 60.0),
+            0.0,
+        )
 
     def complete(self, messages: list[ModelMessage]) -> str:
         if not self.api_key:
             raise RuntimeError("Missing model API key in config.agent.api_key.")
 
+        timeout = None
+        if self.request_timeout_seconds > 0:
+            timeout = httpx.Timeout(
+                connect=min(10.0, self.request_timeout_seconds),
+                read=self.request_timeout_seconds,
+                write=min(10.0, self.request_timeout_seconds),
+                pool=min(5.0, self.request_timeout_seconds),
+            )
+
         client = OpenAI(
             api_key=self.api_key,
             base_url=self.api_base,
+            timeout=timeout,
         )
 
         request_messages = [{"role": message.role, "content": message.content} for message in messages]

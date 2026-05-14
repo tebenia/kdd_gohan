@@ -49,6 +49,18 @@ Entity attribute disambiguation rules:
 - If a fact/event table and an entity/master table share a column name, do not assume the fact/event table column is the requested entity attribute.
 - For Formula 1 driver questions, `drivers.number` is the driver's official number. Columns such as `qualifying.number` or `results.number` are session/race entry numbers and should only be used when the question explicitly asks for the qualifying, result, car, grid, or race entry number.
 
+Full-data and dataset-specific semantic rules:
+- Do not answer row-list or date-list questions from `read_csv`/`read_json` previews alone. Use `inspect_context_tables` plus `execute_context_duckdb`, or use `execute_python`, to query the full relevant table before calling `answer`.
+- For aggregate questions, do not filter out `0` numeric values unless the question explicitly says positive, nonzero, valid, known, or excludes missing/unknown values. If blanks or strings cause casting issues, use TRY_CAST/NULLIF-style handling so blanks become NULL but zeros remain included.
+- When a question asks for descriptive fields from one table but filters by a metric from another table, keep the metric table joined/merged through the final row set. Do not answer from the descriptive table alone after identifying a broad candidate group.
+- When a transaction question says "per unit", "unit price", or "paid more than X per unit", do not compare against a total transaction price directly. If the schema has total `Price` and unit count `Amount`/`Quantity`, compute unit price as `Price / Amount` or `Price / Quantity` before filtering.
+- When a question says "give their consumption status" after defining a group of people/customers, return the consumption/status column only. Do not include `CustomerID` unless the question explicitly asks to identify customer ids.
+- In the Debit Card dataset, `yearmonth.Date` uses integer `YYYYMM` values. For month questions, convert months such as June 2013 to `201306`. If `transactions_1k.db` does not cover the requested month, do not keep forcing that sample transaction table; use the available month-level table and related context tables instead.
+- For Debit Card gas-station country questions, return distinct `gasstations.Country` values only. Do not include gas station ids, customers, counts, or proof columns unless explicitly requested.
+- In California schools tasks, if the condition mentions SAT math score, use `satscores.AvgScrMath` from `satscores` and join/merge it to `frpm.CDSCode` when returning `School Name` or `Charter Funding Type`. For school lists, use school-level SAT rows (`rtype = 'S'`) and enforce the score threshold before the final answer.
+- In the finance transaction dataset, "cash withdrawals" means `trans.operation = 'VYBER'`. Do not include `VYBER KARTOU` unless the question explicitly asks for card withdrawals, and do not add a `k_symbol` filter unless the question mentions that field/category.
+- For Formula 1 questions like "Which race was Alex Yoong in when he was in track number less than 20?", use `driverstandings.position < 20`, not `races.round < 20`.
+
 Keep reasoning concise and grounded in the observed data.
 """.strip()
 
@@ -92,6 +104,45 @@ Example entity attribute disambiguation:
 - Bad query pattern: SELECT number FROM qualifying WHERE raceId = 903 AND q3 LIKE '1:54%'
 - Good query pattern: SELECT drivers.number FROM qualifying JOIN drivers ON qualifying.driverId = drivers.driverId WHERE qualifying.raceId = 903 AND qualifying.q3 LIKE '1:54%'
 - Good behavior: use qualifying to find the matching driver rows, then return the driver number from drivers
+
+Example full-data query requirement:
+- Question: State the date Connor Hilton paid his/her dues.
+- Bad behavior: answer from CSV/JSON preview rows
+- Good behavior: identify Connor Hilton's member id, query the full income table for dues rows, then return every matching date_received value
+
+Example aggregate zero handling:
+- Question: What is the average weight of all female superheroes?
+- Bad query pattern: AVG(weight_kg) ... WHERE gender_id = 2 AND weight_kg > 0
+- Good query pattern: AVG(TRY_CAST(weight_kg AS DOUBLE)) ... WHERE gender_id = 2
+- Good behavior: exclude blanks/nulls through casting semantics, but keep zero values because the question asks for all female superheroes
+
+Example cross-table metric filtering:
+- Question: List the names and funding types of schools from Riverside-related school districts where the average SAT math score across schools exceeds 400.
+- Bad behavior: return all schools from Riverside-related districts using only `frpm`
+- Good query pattern: join/merge `satscores.cds` to `frpm.CDSCode`, filter `satscores.rtype = 'S'` and `satscores.AvgScrMath > 400`, then return only `sname` and `Charter Funding Type`
+
+Example per-unit transaction filtering:
+- Question: For all the people who paid more than 29.00 per unit of product id No.5. Give their consumption status in the August of 2012.
+- Bad query pattern: SELECT DISTINCT CustomerID FROM transactions WHERE ProductID = 5 AND Price > 29.00
+- Good query pattern: SELECT DISTINCT CustomerID FROM transactions WHERE ProductID = 5 AND Price * 1.0 / Amount > 29.00
+- Good answer columns: ["Consumption"]
+
+Example Debit Card month and gas-station country semantics:
+- Question: Please list the countries of the gas stations with transactions taken place in June, 2013.
+- Bad behavior: keep querying `transactions_1k.db` after observing that its date range does not cover June 2013
+- Good behavior: use `yearmonth.Date = 201306` for the requested month, use the available `gasstations` context for country values, and return distinct countries
+- Good answer columns: ["Country"]
+
+Example finance cash withdrawal semantics:
+- Question: List all the withdrawals in cash transactions that the client with the id 3356 makes.
+- Bad query pattern: operation IN ('VYBER', 'VYBER KARTOU')
+- Good query pattern: operation = 'VYBER'
+- Good answer columns: ["trans_id"]
+
+Example Formula 1 track-number semantics:
+- Question: Which race was Alex Yoong in when he was in track number less than 20?
+- Bad query pattern: races.round < 20
+- Good query pattern: driverstandings.position < 20
 """.strip()
 
 

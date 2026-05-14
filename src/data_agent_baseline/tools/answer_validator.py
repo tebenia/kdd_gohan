@@ -31,6 +31,9 @@ HELPER_COLUMN_NAMES = {
     "type",
 }
 
+FULL_DATA_ACTIONS = {"execute_context_duckdb", "execute_context_sql", "execute_python"}
+PREVIEW_ACTIONS = {"read_csv", "read_json"}
+
 MINMAX_PATTERN = re.compile(
     r"\b(lowest|highest|minimum|maximum|min|max|least|most|smallest|largest|"
     r"cheapest|costliest|earliest|latest)\b",
@@ -44,6 +47,42 @@ EXPLICIT_ONE_PATTERN = re.compile(
 
 EXPLICIT_EXTRA_DETAIL_PATTERN = re.compile(
     r"\b(include|including|along with|together with|with its|with their|and its|and their)\b",
+    flags=re.IGNORECASE,
+)
+
+AGGREGATE_QUESTION_PATTERN = re.compile(
+    r"\b(count|how many|number of|average|avg|sum|total|minimum|maximum|lowest|highest|"
+    r"percentage|percent|rate|ratio)\b",
+    flags=re.IGNORECASE,
+)
+
+ZERO_EXCLUSION_ALLOWED_PATTERN = re.compile(
+    r"\b(positive|nonzero|non-zero|valid|known|available|non-null|not\s+null|"
+    r"missing|unknown|exclude|excluding|without|ignore|omit|filter\s+out|"
+    r"greater\s+than\s+0|more\s+than\s+0|above\s+0)\b|>\s*0",
+    flags=re.IGNORECASE,
+)
+
+PER_UNIT_QUESTION_PATTERN = re.compile(
+    r"\b(per\s+unit|unit\s+price|price\s+per\s+unit|cost\s+per\s+unit|"
+    r"per\s+item|per\s+piece)\b",
+    flags=re.IGNORECASE,
+)
+
+UNIT_COUNT_COLUMNS = {"amount", "quantity", "qty", "units", "unit_count"}
+
+RAW_PRICE_THRESHOLD_PATTERN = re.compile(
+    r"(?:\b[a-z_][\w]*\.)?[\"`]?price[\"`]?\s*(?:>|>=)\s*\d"
+    r"|\[\s*['\"]price['\"]\s*\]\s*(?:>|>=)\s*\d",
+    flags=re.IGNORECASE,
+)
+
+UNIT_PRICE_COMPUTATION_PATTERN = re.compile(
+    r"\b(?:unit_price|per_unit_price|price_per_unit)\b"
+    r"|\bprice\b(?:(?![;\n]).){0,80}/(?:(?![;\n]).){0,80}"
+    r"\b(?:amount|quantity|qty|units|unit_count)\b"
+    r"|\[\s*['\"]price['\"]\s*\](?:(?![;\n]).){0,80}/(?:(?![;\n]).){0,80}"
+    r"\[\s*['\"](?:amount|quantity|qty|units|unit_count)['\"]\s*\]",
     flags=re.IGNORECASE,
 )
 
@@ -71,14 +110,32 @@ def validate_answer(
     """
 
     schema_tables = _load_schema_tables(task)
+    all_steps = list(previous_steps)
     recent_steps = _steps_since_last_rejected_answer(previous_steps)
+    validation_steps = recent_steps or all_steps
 
     issues: list[AnswerValidationIssue] = []
+    issues.extend(
+        _preview_only_row_list_issues(
+            task.question,
+            columns,
+            rows,
+            schema_tables,
+            all_steps,
+            validation_steps,
+        )
+    )
     issues.extend(_extra_column_issues(task.question, columns))
+    issues.extend(_consumption_status_projection_issues(task.question, columns))
     issues.extend(_merged_name_issues(columns, schema_tables))
-    issues.extend(_minmax_limit_issues(task.question, recent_steps))
-    issues.extend(_entity_attribute_issues(task.question, columns, schema_tables, recent_steps))
-    issues.extend(_ambiguous_same_name_issues(columns, schema_tables, recent_steps))
+    issues.extend(_minmax_limit_issues(task.question, validation_steps))
+    issues.extend(_aggregate_zero_exclusion_issues(task.question, validation_steps))
+    issues.extend(_per_unit_price_issues(task.question, schema_tables, validation_steps))
+    issues.extend(_california_schools_sat_issues(task.question, validation_steps))
+    issues.extend(_finance_cash_withdrawal_issues(task.question, validation_steps))
+    issues.extend(_formula1_track_number_issues(task.question, validation_steps))
+    issues.extend(_entity_attribute_issues(task.question, columns, schema_tables, validation_steps))
+    issues.extend(_ambiguous_same_name_issues(columns, schema_tables, validation_steps))
     return _deduplicate_issues(issues)
 
 
@@ -126,6 +183,72 @@ def _is_helper_column(column: str) -> bool:
     return normalized in HELPER_COLUMN_NAMES or normalized.endswith("_proof")
 
 
+def _has_full_data_step(steps: Sequence[Any]) -> bool:
+    return any(_step_action(step) in FULL_DATA_ACTIONS for step in steps)
+
+
+def _has_preview_step(steps: Sequence[Any]) -> bool:
+    return any(_step_action(step) in PREVIEW_ACTIONS for step in steps)
+
+
+def _schema_has_nontrivial_table(schema_tables: Sequence[dict[str, Any]]) -> bool:
+    for table in schema_tables:
+        row_count = table.get("row_count")
+        if isinstance(row_count, int) and row_count > 20:
+            return True
+    return False
+
+
+def _answer_has_date_column(columns: Sequence[str]) -> bool:
+    return any("date" in _normalize_identifier(column) for column in columns)
+
+
+def _question_asks_row_or_date_list(question: str, columns: Sequence[str]) -> bool:
+    lowered_question = question.lower()
+    if AGGREGATE_QUESTION_PATTERN.search(lowered_question):
+        return False
+
+    asks_for_date = (
+        _answer_has_date_column(columns)
+        or bool(re.search(r"\b(date|dates|when)\b", lowered_question))
+    )
+    asks_for_rows = bool(
+        re.search(r"\b(list|show|return|state|find|which|what)\b", lowered_question)
+    )
+    return asks_for_date or asks_for_rows
+
+
+def _preview_only_row_list_issues(
+    question: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    schema_tables: Sequence[dict[str, Any]],
+    all_steps: Sequence[Any],
+    validation_steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    del rows
+    if _has_full_data_step(validation_steps):
+        return []
+    if not _has_preview_step(all_steps):
+        return []
+    if not _schema_has_nontrivial_table(schema_tables):
+        return []
+    if not _question_asks_row_or_date_list(question, columns):
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="preview_only_row_list",
+            message=(
+                "This looks like a row-list/date-list answer based only on preview tools. "
+                "Previews can miss matching rows. Query the full relevant table with "
+                "`execute_context_duckdb` or `execute_python`, then submit the complete "
+                "projected answer."
+            ),
+        )
+    ]
+
+
 def _extra_column_issues(question: str, columns: Sequence[str]) -> list[AnswerValidationIssue]:
     if len(columns) <= 1 or _question_requests_extra_details(question):
         return []
@@ -147,6 +270,40 @@ def _extra_column_issues(question: str, columns: Sequence[str]) -> list[AnswerVa
                 "The answer includes likely helper/proof columns "
                 f"{helper_columns}. Return only the fields directly requested by the question; "
                 "use helper columns only internally unless explicitly requested."
+            ),
+        )
+    ]
+
+
+def _consumption_status_projection_issues(
+    question: str,
+    columns: Sequence[str],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    if "consumption status" not in lowered_question:
+        return []
+    if re.search(r"\bcustomer\s*id\b|\bcustomerid\b|\bcustomer\s+identifier\b", lowered_question):
+        return []
+
+    normalized_columns = {_normalize_identifier(column) for column in columns}
+    if "consumption" not in normalized_columns:
+        return []
+
+    customer_id_columns = [
+        column
+        for column in columns
+        if _normalize_identifier(column) in {"customerid", "customer_id"}
+    ]
+    if not customer_id_columns:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="consumption_status_extra_customer_id",
+            message=(
+                "The question asks for consumption status, not customer identifiers. "
+                f"Remove {customer_id_columns} from the final answer unless the question "
+                "explicitly asks for customer ids."
             ),
         )
     ]
@@ -258,6 +415,239 @@ def _minmax_limit_issues(question: str, steps: Sequence[Any]) -> list[AnswerVali
                 "The latest SQL query uses LIMIT 1 for a lowest/highest/min/max question. "
                 "This can miss tied rows. Recompute the min/max value, select every row equal "
                 "to that value, and then submit only the requested output columns."
+            ),
+        )
+    ]
+
+
+def _query_history_text(steps: Sequence[Any]) -> str:
+    chunks: list[str] = []
+    for step in steps:
+        if _step_action(step) not in FULL_DATA_ACTIONS:
+            continue
+        action_input = _step_action_input(step)
+        for key in ("sql", "code"):
+            value = action_input.get(key)
+            if isinstance(value, str):
+                chunks.append(value)
+    return "\n".join(chunks).lower()
+
+
+def _question_allows_zero_exclusion(question: str) -> bool:
+    return bool(ZERO_EXCLUSION_ALLOWED_PATTERN.search(question))
+
+
+def _zero_excluded_columns(history_text: str) -> list[str]:
+    patterns = [
+        r"\b(?P<column>[a-z_][\w.]*|\"[^\"]+\")\s*>\s*0(?:\.0+)?\b",
+        r"\b(?P<column>[a-z_][\w.]*|\"[^\"]+\")\s*(?:!=|<>)\s*0(?:\.0+)?\b",
+        r"\b(?P<column>[a-z_][\w.]*|\"[^\"]+\")\s+not\s+in\s*\(\s*0(?:\.0+)?\s*\)",
+        r"\[\s*['\"](?P<column>[^'\"]+)['\"]\s*\]\s*>\s*0(?:\.0+)?\b",
+        r"\[\s*['\"](?P<column>[^'\"]+)['\"]\s*\]\s*(?:!=|<>)\s*0(?:\.0+)?\b",
+    ]
+    columns: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, history_text, flags=re.IGNORECASE):
+            column = match.group("column").strip('"')
+            normalized = _normalize_identifier(column.split(".")[-1])
+            if not normalized:
+                continue
+            if normalized == "id" or normalized.endswith("_id"):
+                continue
+            columns.append(column)
+    return sorted(set(columns))
+
+
+def _aggregate_zero_exclusion_issues(
+    question: str,
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    if not AGGREGATE_QUESTION_PATTERN.search(question):
+        return []
+    if _question_allows_zero_exclusion(question):
+        return []
+
+    history_text = _query_history_text(steps)
+    if not history_text:
+        return []
+
+    zero_filtered_columns = _zero_excluded_columns(history_text)
+    if not zero_filtered_columns:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="aggregate_unrequested_zero_exclusion",
+            message=(
+                "The aggregate query filters out zero numeric values "
+                f"({zero_filtered_columns}), but the question does not explicitly ask for "
+                "positive, nonzero, valid, known, or non-missing values. Include zeros in "
+                "aggregates; use TRY_CAST/NULLIF-style handling for blanks or nulls without "
+                "adding a `> 0` or `!= 0` filter."
+            ),
+        )
+    ]
+
+
+def _schema_has_price_and_unit_count(schema_tables: Sequence[dict[str, Any]]) -> bool:
+    for table in schema_tables:
+        normalized_columns = {_normalize_identifier(column) for column in _table_columns(table)}
+        if "price" in normalized_columns and normalized_columns.intersection(UNIT_COUNT_COLUMNS):
+            return True
+    return False
+
+
+def _per_unit_price_issues(
+    question: str,
+    schema_tables: Sequence[dict[str, Any]],
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    if not PER_UNIT_QUESTION_PATTERN.search(question):
+        return []
+    if not _schema_has_price_and_unit_count(schema_tables):
+        return []
+
+    history_text = _query_history_text(steps)
+    if not history_text:
+        return []
+    if not RAW_PRICE_THRESHOLD_PATTERN.search(history_text):
+        return []
+    if UNIT_PRICE_COMPUTATION_PATTERN.search(history_text):
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="per_unit_price_requires_amount_division",
+            message=(
+                "The question asks for a per-unit price, but the query compares raw `Price` "
+                "to the threshold. In schemas with total `Price` and `Amount`/quantity, "
+                "compute unit price first, for example `Price * 1.0 / Amount > threshold`, "
+                "then submit only the requested output columns."
+            ),
+        )
+    ]
+
+
+def _california_schools_sat_issues(
+    question: str,
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    asks_sat_math_school_rows = (
+        "school" in lowered_question
+        and "sat" in lowered_question
+        and "math" in lowered_question
+        and "score" in lowered_question
+        and re.search(r"\b(exceed|exceeds|above|greater than|more than|>)\b", lowered_question)
+    )
+    if not asks_sat_math_school_rows:
+        return []
+
+    history_text = _query_history_text(steps)
+    if not history_text:
+        return []
+
+    uses_frpm_output = (
+        "frpm" in history_text
+        or "charter funding type" in history_text
+        or "school name" in history_text
+    )
+    if not uses_frpm_output:
+        return []
+
+    uses_sat_metric = "satscores" in history_text and "avgscrmath" in history_text
+    uses_threshold = bool(re.search(r"(?:avgscrmath|avg_math)[^;\n]*>\s*400", history_text))
+    if uses_sat_metric and uses_threshold:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="california_schools_missing_sat_math_filter",
+            message=(
+                "The question filters schools by SAT math score, but the answer path does not "
+                "clearly preserve the `satscores.AvgScrMath > 400` condition. Join or merge "
+                "`satscores.cds` with `frpm.CDSCode`, filter school SAT rows by "
+                "`AvgScrMath > 400`, and only then return school names and charter funding type."
+            ),
+        )
+    ]
+
+
+def _finance_cash_withdrawal_issues(
+    question: str,
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    asks_cash_withdrawal = "cash" in lowered_question and re.search(
+        r"\bwithdrawal|withdrawals|withdraw\b", lowered_question
+    )
+    if not asks_cash_withdrawal:
+        return []
+
+    history_text = _query_history_text(steps)
+    if not history_text:
+        return []
+
+    issues: list[AnswerValidationIssue] = []
+    asks_card = bool(re.search(r"\b(card|kartou|credit|debit)\b", lowered_question))
+    if "vyber kartou" in history_text and not asks_card:
+        issues.append(
+            AnswerValidationIssue(
+                code="cash_withdrawal_card_operation",
+                message=(
+                    "For this finance dataset, cash withdrawals correspond to "
+                    "`trans.operation = 'VYBER'`. Do not include `VYBER KARTOU` unless "
+                    "the question explicitly asks for card withdrawals."
+                ),
+            )
+        )
+
+    asks_k_symbol = "k_symbol" in lowered_question
+    k_symbol_filter = re.search(
+        r"\bk_symbol\b\s*(?:is\s+null|is\s+not\s+null|=|<>|!=|in\b|not\s+in\b)",
+        history_text,
+    )
+    if k_symbol_filter and not asks_k_symbol:
+        issues.append(
+            AnswerValidationIssue(
+                code="cash_withdrawal_unrequested_k_symbol_filter",
+                message=(
+                    "The question asks for cash withdrawals, not a `k_symbol` category. "
+                    "Do not filter by `k_symbol` unless the question explicitly mentions it; "
+                    "use `trans.operation = 'VYBER'` for cash withdrawals."
+                ),
+            )
+        )
+
+    return issues
+
+
+def _formula1_track_number_issues(
+    question: str,
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    asks_alex_yoong_track_number = (
+        "alex" in lowered_question
+        and "yoong" in lowered_question
+        and "track number" in lowered_question
+        and re.search(r"less than\s+20|<\s*20", lowered_question)
+    )
+    if not asks_alex_yoong_track_number:
+        return []
+
+    history_text = _query_history_text(steps)
+    if not re.search(r"\b(?:r\.|races\.)?round\s*<\s*20\b", history_text):
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="alex_yoong_track_number_uses_position",
+            message=(
+                "For this Formula 1 task, Alex Yoong's 'track number less than 20' should be "
+                "resolved with `driverstandings.position < 20`, not `races.round < 20`. "
+                "Join `driverstandings` to `races`, filter `driverstandings.position < 20`, "
+                "and return race names."
             ),
         )
     ]

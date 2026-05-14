@@ -39,11 +39,24 @@ class ModelMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class ModelStep:
-    thought: str
+class ModelAction:
     action: str
     action_input: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStep:
+    thought: str
+    actions: list[ModelAction]
     raw_response: str
+
+    @property
+    def action(self) -> str:
+        return self.actions[0].action
+
+    @property
+    def action_input(self) -> dict[str, Any]:
+        return self.actions[0].action_input
 
 
 class ModelAdapter(Protocol):
@@ -133,6 +146,7 @@ class OpenAIModelAdapter:
             api_key=self.api_key,
             base_url=self.api_base,
             timeout=timeout,
+            max_retries=0,
         )
 
         request_messages = [{"role": message.role, "content": message.content} for message in messages]

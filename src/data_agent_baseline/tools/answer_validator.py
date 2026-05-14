@@ -200,11 +200,11 @@ def _is_helper_column(column: str) -> bool:
 
 
 def _has_full_data_step(steps: Sequence[Any]) -> bool:
-    return any(_step_action(step) in FULL_DATA_ACTIONS for step in steps)
+    return any(action in FULL_DATA_ACTIONS for step in steps for action in _step_actions(step))
 
 
 def _has_preview_step(steps: Sequence[Any]) -> bool:
-    return any(_step_action(step) in PREVIEW_ACTIONS for step in steps)
+    return any(action in PREVIEW_ACTIONS for step in steps for action in _step_actions(step))
 
 
 def _schema_has_nontrivial_table(schema_tables: Sequence[dict[str, Any]]) -> bool:
@@ -379,12 +379,33 @@ def _step_action(step: Any) -> str:
     return str(getattr(step, "action", "") or "")
 
 
+def _step_actions(step: Any) -> list[str]:
+    action = _step_action(step)
+    if not action:
+        return []
+    if action == "__error__":
+        return ["__error__"]
+    return [item.strip() for item in action.split(",") if item.strip()]
+
+
 def _step_action_input(step: Any) -> dict[str, Any]:
     if isinstance(step, dict):
         action_input = step.get("action_input")
     else:
         action_input = getattr(step, "action_input", None)
     return action_input if isinstance(action_input, dict) else {}
+
+
+def _step_action_inputs(step: Any) -> list[dict[str, Any]]:
+    if isinstance(step, dict):
+        action_input = step.get("action_input")
+    else:
+        action_input = getattr(step, "action_input", None)
+    if isinstance(action_input, list):
+        return [item for item in action_input if isinstance(item, dict)]
+    if isinstance(action_input, dict):
+        return [action_input]
+    return []
 
 
 def _step_observation(step: Any) -> dict[str, Any]:
@@ -395,24 +416,40 @@ def _step_observation(step: Any) -> dict[str, Any]:
     return observation if isinstance(observation, dict) else {}
 
 
+def _step_observations(step: Any) -> list[dict[str, Any]]:
+    if isinstance(step, dict):
+        observation = step.get("observation")
+    else:
+        observation = getattr(step, "observation", None)
+    if isinstance(observation, list):
+        return [item for item in observation if isinstance(item, dict)]
+    if isinstance(observation, dict):
+        return [observation]
+    return []
+
+
 def _steps_since_last_rejected_answer(previous_steps: Sequence[Any]) -> list[Any]:
     start_index = 0
     for index, step in enumerate(previous_steps):
-        if _step_action(step) != "answer":
+        if "answer" not in _step_actions(step):
             continue
-        observation = _step_observation(step)
-        if observation.get("ok") is False:
+        observations = _step_observations(step)
+        if any(observation.get("ok") is False for observation in observations):
             start_index = index + 1
     return list(previous_steps[start_index:])
 
 
 def _last_sql_text(steps: Sequence[Any]) -> str | None:
     for step in reversed(steps):
-        if _step_action(step) not in {"execute_context_duckdb", "execute_context_sql"}:
-            continue
-        sql = _step_action_input(step).get("sql")
-        if isinstance(sql, str) and sql.strip():
-            return sql
+        actions = _step_actions(step)
+        inputs = _step_action_inputs(step)
+        for index in range(len(inputs) - 1, -1, -1):
+            action = actions[index] if index < len(actions) else ""
+            if action not in {"execute_context_duckdb", "execute_context_sql"}:
+                continue
+            sql = inputs[index].get("sql")
+            if isinstance(sql, str) and sql.strip():
+                return sql
     return None
 
 
@@ -439,13 +476,16 @@ def _minmax_limit_issues(question: str, steps: Sequence[Any]) -> list[AnswerVali
 def _query_history_text(steps: Sequence[Any]) -> str:
     chunks: list[str] = []
     for step in steps:
-        if _step_action(step) not in FULL_DATA_ACTIONS:
-            continue
-        action_input = _step_action_input(step)
-        for key in ("sql", "code"):
-            value = action_input.get(key)
-            if isinstance(value, str):
-                chunks.append(value)
+        actions = _step_actions(step)
+        inputs = _step_action_inputs(step)
+        for index, action_input in enumerate(inputs):
+            action = actions[index] if index < len(actions) else ""
+            if action not in FULL_DATA_ACTIONS:
+                continue
+            for key in ("sql", "code"):
+                value = action_input.get(key)
+                if isinstance(value, str):
+                    chunks.append(value)
     return "\n".join(chunks).lower()
 
 
@@ -771,10 +811,11 @@ def _formula1_track_number_issues(
 def _recent_history_text(steps: Sequence[Any]) -> str:
     chunks: list[str] = []
     for step in steps:
-        chunks.append(_step_action(step))
-        action_input = _step_action_input(step)
-        if action_input:
-            chunks.append(json.dumps(action_input, ensure_ascii=False, sort_keys=True))
+        chunks.extend(_step_actions(step))
+        action_inputs = _step_action_inputs(step)
+        for action_input in action_inputs:
+            if action_input:
+                chunks.append(json.dumps(action_input, ensure_ascii=False, sort_keys=True))
         if isinstance(step, dict):
             raw_response = step.get("raw_response")
         else:

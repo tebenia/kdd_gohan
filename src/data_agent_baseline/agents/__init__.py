@@ -1,4 +1,5 @@
 from data_agent_baseline.agents.model import (
+    ModelAction,
     ModelAdapter,
     ModelMessage,
     ModelStep,
@@ -16,6 +17,7 @@ from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState
 __all__ = [
     "AgentRunResult",
     "AgentRuntimeState",
+    "ModelAction",
     "ModelAdapter",
     "ModelMessage",
     "ModelStep",

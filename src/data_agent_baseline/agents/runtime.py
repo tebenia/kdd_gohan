@@ -11,9 +11,9 @@ class StepRecord:
     step_index: int
     thought: str
     action: str
-    action_input: dict[str, Any]
+    action_input: dict[str, Any] | list[dict[str, Any]]
     raw_response: str
-    observation: dict[str, Any]
+    observation: dict[str, Any] | list[dict[str, Any]]
     ok: bool
 
     def to_dict(self) -> dict[str, Any]:

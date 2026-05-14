@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
+from data_agent_baseline.tools.answer_validator import validate_answer
 from data_agent_baseline.tools.duckdb import execute_context_duckdb_sql, inspect_context_tables
 from data_agent_baseline.tools.filesystem import (
     list_context_tree,
@@ -33,49 +34,86 @@ class ToolExecutionResult:
     answer: AnswerTable | None = None
 
 
-ToolHandler = Callable[[PublicTask, dict[str, Any]], ToolExecutionResult]
+@dataclass(frozen=True, slots=True)
+class ToolExecutionContext:
+    previous_steps: tuple[Any, ...] = ()
 
 
-def _list_context(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+ToolHandler = Callable[[PublicTask, dict[str, Any], ToolExecutionContext], ToolExecutionResult]
+
+
+def _list_context(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     max_depth = int(action_input.get("max_depth", 4))
     return ToolExecutionResult(ok=True, content=list_context_tree(task, max_depth=max_depth))
 
 
-def _read_csv(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _read_csv(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     path = str(action_input["path"])
     max_rows = int(action_input.get("max_rows", 20))
     return ToolExecutionResult(ok=True, content=read_csv_preview(task, path, max_rows=max_rows))
 
 
-def _read_json(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _read_json(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     path = str(action_input["path"])
     max_chars = int(action_input.get("max_chars", 4000))
     return ToolExecutionResult(ok=True, content=read_json_preview(task, path, max_chars=max_chars))
 
 
-def _read_doc(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _read_doc(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     path = str(action_input["path"])
     max_chars = int(action_input.get("max_chars", 4000))
     return ToolExecutionResult(ok=True, content=read_doc_preview(task, path, max_chars=max_chars))
 
 
-def _inspect_sqlite_schema(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _inspect_sqlite_schema(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     path = resolve_context_path(task, str(action_input["path"]))
     return ToolExecutionResult(ok=True, content=inspect_sqlite_schema(path))
 
 
-def _execute_context_sql(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _execute_context_sql(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     path = resolve_context_path(task, str(action_input["path"]))
     sql = str(action_input["sql"])
     limit = int(action_input.get("limit", 200))
     return ToolExecutionResult(ok=True, content=execute_read_only_sql(path, sql, limit=limit))
 
 
-def _inspect_context_tables(task: PublicTask, _: dict[str, Any]) -> ToolExecutionResult:
+def _inspect_context_tables(
+    task: PublicTask,
+    _: dict[str, Any],
+    __: ToolExecutionContext,
+) -> ToolExecutionResult:
     return ToolExecutionResult(ok=True, content=inspect_context_tables(task.context_dir))
 
 
-def _execute_context_duckdb(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _execute_context_duckdb(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     sql = str(action_input["sql"])
     limit = int(action_input.get("limit", 200))
     return ToolExecutionResult(
@@ -84,7 +122,11 @@ def _execute_context_duckdb(task: PublicTask, action_input: dict[str, Any]) -> T
     )
 
 
-def _execute_python(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _execute_python(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    _: ToolExecutionContext,
+) -> ToolExecutionResult:
     code = str(action_input["code"])
     content = execute_python_code(
         context_root=task.context_dir,
@@ -94,7 +136,11 @@ def _execute_python(task: PublicTask, action_input: dict[str, Any]) -> ToolExecu
     return ToolExecutionResult(ok=bool(content.get("success")), content=content)
 
 
-def _answer(_: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+def _answer(
+    task: PublicTask,
+    action_input: dict[str, Any],
+    context: ToolExecutionContext,
+) -> ToolExecutionResult:
     columns = action_input.get("columns")
     rows = action_input.get("rows")
     if not isinstance(columns, list) or not columns or not all(isinstance(item, str) for item in columns):
@@ -109,6 +155,26 @@ def _answer(_: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
         if len(row) != len(columns):
             raise ValueError("Each answer row must match the number of columns.")
         normalized_rows.append(list(row))
+
+    validation_issues = validate_answer(
+        task,
+        columns=columns,
+        rows=normalized_rows,
+        previous_steps=context.previous_steps,
+    )
+    if validation_issues:
+        return ToolExecutionResult(
+            ok=False,
+            content={
+                "status": "rejected",
+                "reason": "answer_validator_rejected",
+                "issues": [issue.to_dict() for issue in validation_issues],
+                "instruction": (
+                    "Revise the query or final projection using the validator feedback, then "
+                    "call answer again with the corrected table."
+                ),
+            },
+        )
 
     answer = AnswerTable(columns=list(columns), rows=normalized_rows)
     return ToolExecutionResult(
@@ -136,10 +202,16 @@ class ToolRegistry:
             lines.append(f"  input_schema: {spec.input_schema}")
         return "\n".join(lines)
 
-    def execute(self, task: PublicTask, action: str, action_input: dict[str, Any]) -> ToolExecutionResult:
+    def execute(
+        self,
+        task: PublicTask,
+        action: str,
+        action_input: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> ToolExecutionResult:
         if action not in self.handlers:
             raise KeyError(f"Unknown tool: {action}")
-        return self.handlers[action](task, action_input)
+        return self.handlers[action](task, action_input, context or ToolExecutionContext())
 
 
 def create_default_tool_registry() -> ToolRegistry:
@@ -151,7 +223,8 @@ def create_default_tool_registry() -> ToolRegistry:
                 "Return only the columns directly requested by the question; omit proof, helper, "
                 "filtering, sorting, ranking, join-key, and calculation columns unless explicitly "
                 "asked for them. If a column was only needed to find the answer, do not include it "
-                "in the final answer table."
+                "in the final answer table. The answer may be rejected with validator feedback; "
+                "if that happens, revise the query or projection and call answer again."
             ),
             input_schema={
                 "columns": ["column_name"],

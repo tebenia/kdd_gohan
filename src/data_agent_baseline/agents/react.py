@@ -13,7 +13,7 @@ from data_agent_baseline.agents.prompt import (
 )
 from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState, StepRecord
 from data_agent_baseline.benchmark.schema import PublicTask
-from data_agent_baseline.tools.registry import ToolRegistry
+from data_agent_baseline.tools.registry import ToolExecutionContext, ToolRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +113,12 @@ class ReActAgent:
             raw_response = self.model.complete(self._build_messages(task, state))
             try:
                 model_step = parse_model_step(raw_response)
-                tool_result = self.tools.execute(task, model_step.action, model_step.action_input)
+                tool_result = self.tools.execute(
+                    task,
+                    model_step.action,
+                    model_step.action_input,
+                    ToolExecutionContext(previous_steps=tuple(state.steps)),
+                )
                 observation = {
                     "ok": tool_result.ok,
                     "tool": model_step.action,

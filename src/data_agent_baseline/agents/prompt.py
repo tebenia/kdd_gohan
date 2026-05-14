@@ -20,6 +20,7 @@ Rules:
 7. Do not output any text before or after the fenced JSON block.
 8. For efficiency, strictly prefer using `sqlite3` for .db files and `pandas` for .csv/.json files rather than writing raw Python loops.
 9. ALWAYS ensure your JSON is valid. Escape newlines (`\\n`) and double quotes (`\\"`) properly inside JSON strings.
+10. If the `answer` tool returns `ok=false`, use its validator feedback to revise your query or final projection, then call `answer` again.
 
 Answer-table schema rules:
 - Return only the fields directly requested by the question.

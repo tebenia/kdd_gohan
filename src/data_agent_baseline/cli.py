@@ -164,7 +164,10 @@ def run_benchmark_command(
     task_total = len(dataset.iter_tasks())
     if limit is not None:
         task_total = min(task_total, limit)
-    effective_workers = app_config.run.max_workers
+    effective_workers = max(
+        [app_config.run.max_workers, *app_config.run.difficulty_max_workers.values()],
+        default=app_config.run.max_workers,
+    )
 
     progress_columns = [
         SpinnerColumn(),

@@ -35,6 +35,7 @@ class SubmissionConfig:
     model_api_key: str
     max_steps: int
     max_workers: int
+    difficulty_max_workers: dict[str, int]
     task_timeout_seconds: int
 
 
@@ -61,6 +62,22 @@ def _env_int(name: str, default: int) -> int:
     return int(value.strip())
 
 
+def _env_int_optional(name: str) -> int | None:
+    value = os.environ.get(name)
+    if not value or not value.strip():
+        return None
+    return int(value.strip())
+
+
+def _difficulty_worker_overrides() -> dict[str, int]:
+    overrides = {"hard": 1}
+    for difficulty in ("easy", "medium", "hard"):
+        value = _env_int_optional(f"SUBMISSION_{difficulty.upper()}_MAX_WORKERS")
+        if value is not None:
+            overrides[difficulty] = max(value, 1)
+    return overrides
+
+
 def load_submission_config() -> SubmissionConfig:
     model_api_url = os.environ.get("MODEL_API_URL", "").strip()
     if not model_api_url:
@@ -74,7 +91,8 @@ def load_submission_config() -> SubmissionConfig:
         model_api_url=model_api_url,
         model_api_key=os.environ.get("MODEL_API_KEY", "EMPTY").strip() or "EMPTY",
         max_steps=_env_int("AGENT_MAX_STEPS", 16),
-        max_workers=max(_env_int("SUBMISSION_MAX_WORKERS", 1), 1),
+        max_workers=max(_env_int("SUBMISSION_MAX_WORKERS", 4), 1),
+        difficulty_max_workers=_difficulty_worker_overrides(),
         task_timeout_seconds=_env_int("SUBMISSION_TASK_TIMEOUT_SECONDS", 600),
     )
 
@@ -114,6 +132,17 @@ def load_public_task(task_dir: Path) -> PublicTask:
     if not context_dir.is_dir():
         raise FileNotFoundError(f"Missing context dir: {context_dir}")
     return PublicTask(record=record, assets=TaskAssets(task_dir=task_dir, context_dir=context_dir))
+
+
+def task_difficulty(task_dir: Path) -> str:
+    task_json_path = task_dir / "task.json"
+    payload = json.loads(task_json_path.read_text())
+    return str(payload.get("difficulty", "")).strip().lower()
+
+
+def task_worker_count(task_dir: Path, config: SubmissionConfig) -> int:
+    difficulty = task_difficulty(task_dir)
+    return max(config.difficulty_max_workers.get(difficulty, config.max_workers), 1)
 
 
 def iter_task_dirs(input_root: Path) -> list[Path]:
@@ -282,47 +311,73 @@ def write_summary(log_root: Path, payload: dict[str, Any]) -> None:
     summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
+def _print_task_result(result: SubmissionTaskResult) -> None:
+    status = "ok" if result.succeeded else "fail"
+    print(
+        f"{result.task_id}: {status} elapsed={result.elapsed_seconds}s "
+        f"prediction={result.prediction_path}",
+        flush=True,
+    )
+
+
+def _process_task_group(task_dirs: list[Path], *, max_workers: int, config: SubmissionConfig) -> list[SubmissionTaskResult]:
+    if max_workers < 1:
+        raise ValueError("max_workers must be at least 1.")
+
+    difficulties = sorted({task_difficulty(task_dir) or "unknown" for task_dir in task_dirs})
+    print(
+        f"Running {len(task_dirs)} tasks with max_workers={max_workers} "
+        f"difficulties={','.join(difficulties)}.",
+        flush=True,
+    )
+
+    results: list[SubmissionTaskResult] = []
+    if max_workers == 1:
+        for task_dir in task_dirs:
+            if STOP_REQUESTED:
+                break
+            result = process_task(task_dir, config)
+            results.append(result)
+            _print_task_result(result)
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for task_dir in task_dirs:
+            if STOP_REQUESTED:
+                break
+            futures.append(executor.submit(process_task, task_dir, config))
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            _print_task_result(result)
+    return results
+
+
 def run_submission(config: SubmissionConfig) -> int:
     started_at = perf_counter()
     print(
         f"[{datetime.now(timezone.utc).isoformat()}] "
         f"Starting submission run input={config.input_root} output={config.output_root} "
         f"model={config.model_name} max_steps={config.max_steps} "
-        f"max_workers={config.max_workers} task_timeout_seconds={config.task_timeout_seconds}",
+        f"max_workers={config.max_workers} difficulty_max_workers={config.difficulty_max_workers} "
+        f"task_timeout_seconds={config.task_timeout_seconds}",
         flush=True,
     )
     task_dirs = iter_task_dirs(config.input_root)
     print(f"Discovered {len(task_dirs)} tasks.", flush=True)
 
+    grouped_task_dirs: dict[int, list[Path]] = {}
+    for task_dir in task_dirs:
+        grouped_task_dirs.setdefault(task_worker_count(task_dir, config), []).append(task_dir)
+
     results: list[SubmissionTaskResult] = []
-    if config.max_workers == 1:
-        for task_dir in task_dirs:
-            if STOP_REQUESTED:
-                break
-            result = process_task(task_dir, config)
-            results.append(result)
-            status = "ok" if result.succeeded else "fail"
-            print(
-                f"{result.task_id}: {status} elapsed={result.elapsed_seconds}s "
-                f"prediction={result.prediction_path}",
-                flush=True,
-            )
-    else:
-        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-            futures = []
-            for task_dir in task_dirs:
-                if STOP_REQUESTED:
-                    break
-                futures.append(executor.submit(process_task, task_dir, config))
-            for future in as_completed(futures):
-                result = future.result()
-                results.append(result)
-                status = "ok" if result.succeeded else "fail"
-                print(
-                    f"{result.task_id}: {status} elapsed={result.elapsed_seconds}s "
-                    f"prediction={result.prediction_path}",
-                    flush=True,
-                )
+    for max_workers in sorted(grouped_task_dirs, reverse=True):
+        if STOP_REQUESTED:
+            break
+        results.extend(
+            _process_task_group(grouped_task_dirs[max_workers], max_workers=max_workers, config=config)
+        )
 
     results.sort(key=lambda item: (task_number(item.task_id), item.task_id))
     summary = {
@@ -331,6 +386,12 @@ def run_submission(config: SubmissionConfig) -> int:
         "succeeded_task_count": sum(1 for item in results if item.succeeded),
         "elapsed_seconds": round(perf_counter() - started_at, 3),
         "stopped_early": STOP_REQUESTED,
+        "default_max_workers": config.max_workers,
+        "difficulty_max_workers": config.difficulty_max_workers,
+        "worker_group_counts": {
+            str(max_workers): len(grouped_task_dirs[max_workers])
+            for max_workers in sorted(grouped_task_dirs, reverse=True)
+        },
         "tasks": [asdict(item) for item in results],
     }
     write_summary(config.log_root, summary)

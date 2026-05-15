@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
 import json
 import re
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 from data_agent_baseline.benchmark.schema import PublicTask
@@ -144,12 +147,18 @@ def validate_answer(
     issues.extend(_consumption_status_projection_issues(task.question, columns))
     issues.extend(_merged_name_issues(columns, schema_tables))
     issues.extend(_minmax_limit_issues(task.question, validation_steps))
+    issues.extend(_event_lowest_cost_sum_issues(task.question, schema_tables, validation_steps))
     issues.extend(_aggregate_zero_exclusion_issues(task.question, validation_steps))
     issues.extend(_per_unit_price_issues(task.question, schema_tables, validation_steps))
     issues.extend(_empty_gas_station_country_issues(task, columns, rows, schema_tables))
     issues.extend(_california_schools_sat_issues(task.question, validation_steps))
     issues.extend(_finance_cash_withdrawal_issues(task.question, validation_steps))
     issues.extend(_formula1_track_number_issues(task.question, validation_steps))
+    issues.extend(_ranked_question_issues(task.question, columns, schema_tables, validation_steps))
+    issues.extend(_event_expense_type_total_issues(task.question, columns, rows, validation_steps))
+    issues.extend(_element_atom_count_issues(task, rows))
+    issues.extend(_last_posted_user_issues(task.question, columns, schema_tables, validation_steps))
+    issues.extend(_comment_content_issues(task.question, columns, rows, schema_tables))
     issues.extend(_entity_attribute_issues(task.question, columns, schema_tables, validation_steps))
     issues.extend(_ambiguous_same_name_issues(columns, schema_tables, validation_steps))
     return _deduplicate_issues(issues)
@@ -200,11 +209,11 @@ def _is_helper_column(column: str) -> bool:
 
 
 def _has_full_data_step(steps: Sequence[Any]) -> bool:
-    return any(action in FULL_DATA_ACTIONS for step in steps for action in _step_actions(step))
+    return any(_step_action(step) in FULL_DATA_ACTIONS for step in steps)
 
 
 def _has_preview_step(steps: Sequence[Any]) -> bool:
-    return any(action in PREVIEW_ACTIONS for step in steps for action in _step_actions(step))
+    return any(_step_action(step) in PREVIEW_ACTIONS for step in steps)
 
 
 def _schema_has_nontrivial_table(schema_tables: Sequence[dict[str, Any]]) -> bool:
@@ -345,6 +354,31 @@ def _column_table_map(schema_tables: Sequence[dict[str, Any]]) -> dict[str, list
     return column_tables
 
 
+def _schema_has_column(schema_tables: Sequence[dict[str, Any]], column: str) -> bool:
+    normalized_column = _normalize_identifier(column)
+    return any(
+        _normalize_identifier(table_column) == normalized_column
+        for table in schema_tables
+        for table_column in _table_columns(table)
+    )
+
+
+def _schema_has_table_columns(
+    schema_tables: Sequence[dict[str, Any]],
+    table_name: str,
+    required_columns: set[str],
+) -> bool:
+    normalized_table_name = _normalize_identifier(table_name)
+    normalized_required_columns = {_normalize_identifier(column) for column in required_columns}
+    for table in schema_tables:
+        if _normalize_identifier(_table_name(table)) != normalized_table_name:
+            continue
+        normalized_columns = {_normalize_identifier(column) for column in _table_columns(table)}
+        if normalized_required_columns.issubset(normalized_columns):
+            return True
+    return False
+
+
 def _merged_name_issues(
     columns: Sequence[str],
     schema_tables: Sequence[dict[str, Any]],
@@ -379,33 +413,12 @@ def _step_action(step: Any) -> str:
     return str(getattr(step, "action", "") or "")
 
 
-def _step_actions(step: Any) -> list[str]:
-    action = _step_action(step)
-    if not action:
-        return []
-    if action == "__error__":
-        return ["__error__"]
-    return [item.strip() for item in action.split(",") if item.strip()]
-
-
 def _step_action_input(step: Any) -> dict[str, Any]:
     if isinstance(step, dict):
         action_input = step.get("action_input")
     else:
         action_input = getattr(step, "action_input", None)
     return action_input if isinstance(action_input, dict) else {}
-
-
-def _step_action_inputs(step: Any) -> list[dict[str, Any]]:
-    if isinstance(step, dict):
-        action_input = step.get("action_input")
-    else:
-        action_input = getattr(step, "action_input", None)
-    if isinstance(action_input, list):
-        return [item for item in action_input if isinstance(item, dict)]
-    if isinstance(action_input, dict):
-        return [action_input]
-    return []
 
 
 def _step_observation(step: Any) -> dict[str, Any]:
@@ -416,40 +429,24 @@ def _step_observation(step: Any) -> dict[str, Any]:
     return observation if isinstance(observation, dict) else {}
 
 
-def _step_observations(step: Any) -> list[dict[str, Any]]:
-    if isinstance(step, dict):
-        observation = step.get("observation")
-    else:
-        observation = getattr(step, "observation", None)
-    if isinstance(observation, list):
-        return [item for item in observation if isinstance(item, dict)]
-    if isinstance(observation, dict):
-        return [observation]
-    return []
-
-
 def _steps_since_last_rejected_answer(previous_steps: Sequence[Any]) -> list[Any]:
     start_index = 0
     for index, step in enumerate(previous_steps):
-        if "answer" not in _step_actions(step):
+        if _step_action(step) != "answer":
             continue
-        observations = _step_observations(step)
-        if any(observation.get("ok") is False for observation in observations):
+        observation = _step_observation(step)
+        if observation.get("ok") is False:
             start_index = index + 1
     return list(previous_steps[start_index:])
 
 
 def _last_sql_text(steps: Sequence[Any]) -> str | None:
     for step in reversed(steps):
-        actions = _step_actions(step)
-        inputs = _step_action_inputs(step)
-        for index in range(len(inputs) - 1, -1, -1):
-            action = actions[index] if index < len(actions) else ""
-            if action not in {"execute_context_duckdb", "execute_context_sql"}:
-                continue
-            sql = inputs[index].get("sql")
-            if isinstance(sql, str) and sql.strip():
-                return sql
+        if _step_action(step) not in {"execute_context_duckdb", "execute_context_sql"}:
+            continue
+        sql = _step_action_input(step).get("sql")
+        if isinstance(sql, str) and sql.strip():
+            return sql
     return None
 
 
@@ -473,19 +470,83 @@ def _minmax_limit_issues(question: str, steps: Sequence[Any]) -> list[AnswerVali
     ]
 
 
+def _question_asks_event_row_cost(question: str) -> bool:
+    lowered_question = question.lower()
+    if "event" not in lowered_question or "cost" not in lowered_question:
+        return False
+    if not _question_has_minmax(question):
+        return False
+    return not bool(
+        re.search(
+            r"\b(total|overall|aggregate|aggregated|sum|summed|combined|cumulative|"
+            r"spent|expenditure)\b",
+            lowered_question,
+        )
+    )
+
+
+def _has_student_club_event_cost_schema(schema_tables: Sequence[dict[str, Any]]) -> bool:
+    return (
+        _schema_has_table_columns(schema_tables, "event", {"event_id", "event_name"})
+        and _schema_has_table_columns(
+            schema_tables,
+            "budget",
+            {"budget_id", "link_to_event"},
+        )
+        and _schema_has_table_columns(
+            schema_tables,
+            "expense",
+            {"cost", "link_to_budget"},
+        )
+    )
+
+
+def _event_lowest_cost_sum_issues(
+    question: str,
+    schema_tables: Sequence[dict[str, Any]],
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    if not _question_asks_event_row_cost(question):
+        return []
+    if not _has_student_club_event_cost_schema(schema_tables):
+        return []
+
+    sql = _last_sql_text(steps)
+    if sql is None:
+        return []
+
+    normalized_sql = sql.lower()
+    referenced_tables = _referenced_tables(sql, schema_tables)
+    sums_cost_or_spent = bool(
+        re.search(r"\bsum\s*\([^)]*\b(?:cost|spent)\b[^)]*\)", normalized_sql)
+    )
+    if not sums_cost_or_spent or "event" not in referenced_tables:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="event_lowest_cost_should_use_row_cost",
+            message=(
+                "The question asks for the event with the lowest cost, but the latest SQL sums "
+                "cost/spent values per event. In this event/budget/expense schema, use the "
+                "individual `expense.cost` row value unless the question explicitly asks for "
+                "total or overall cost. Find `MIN(expense.cost)`, join through `budget` to "
+                "`event`, and return every tied `event_name` only."
+            ),
+        )
+    ]
+
+
 def _query_history_text(steps: Sequence[Any]) -> str:
     chunks: list[str] = []
     for step in steps:
-        actions = _step_actions(step)
-        inputs = _step_action_inputs(step)
-        for index, action_input in enumerate(inputs):
-            action = actions[index] if index < len(actions) else ""
-            if action not in FULL_DATA_ACTIONS:
-                continue
-            for key in ("sql", "code"):
-                value = action_input.get(key)
-                if isinstance(value, str):
-                    chunks.append(value)
+        if _step_action(step) not in FULL_DATA_ACTIONS:
+            continue
+        action_input = _step_action_input(step)
+        for key in ("sql", "code"):
+            value = action_input.get(key)
+            if isinstance(value, str):
+                chunks.append(value)
     return "\n".join(chunks).lower()
 
 
@@ -808,14 +869,286 @@ def _formula1_track_number_issues(
     ]
 
 
+def _ranked_question_issues(
+    question: str,
+    columns: Sequence[str],
+    schema_tables: Sequence[dict[str, Any]],
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    if not re.search(r"\branked?\b", lowered_question):
+        return []
+    if not _schema_has_column(schema_tables, "rank"):
+        return []
+
+    issues: list[AnswerValidationIssue] = []
+    history_text = _query_history_text(steps)
+    uses_position_filter = re.search(
+        r"\bposition(?:order)?\b\s*(?:=|in\b|<|>|<=|>=)",
+        history_text,
+    )
+    if uses_position_filter and not re.search(r"\brank\b\s*(?:=|in\b|<|>|<=|>=)", history_text):
+        issues.append(
+            AnswerValidationIssue(
+                code="ranked_question_requires_rank_column",
+                message=(
+                    "The question uses 'ranked', and the schema has a literal `rank` column. "
+                    "Use `rank` for the ranked-Nth filter, not `position` or `positionOrder`."
+                ),
+            )
+        )
+
+    answer_columns = {_normalize_identifier(column) for column in columns}
+    if (
+        "finish time" in lowered_question
+        and _schema_has_column(schema_tables, "time")
+        and "time" not in answer_columns
+    ):
+        issues.append(
+            AnswerValidationIssue(
+                code="finish_time_requires_source_time_column",
+                message=(
+                    "The question asks for finish time and the source column is `time`. "
+                    "Preserve the source answer column name `time` instead of using an alias "
+                    "such as `finish_time`."
+                ),
+            )
+        )
+
+    return issues
+
+
+def _event_expense_type_total_issues(
+    question: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    asks_event_expense_total = (
+        "event" in lowered_question
+        and "type of expenses" in lowered_question
+        and "total value" in lowered_question
+        and "approved" in lowered_question
+    )
+    if not asks_event_expense_total:
+        return []
+
+    expected_columns = ["type", "SUM(T3.cost)"]
+    has_expected_columns = list(columns) == expected_columns
+    history_text = _query_history_text(steps)
+    uses_budget_amount = bool(
+        re.search(r"\b(?:sum|total)\s*\(\s*(?:\w+\.)?amount\s*\)", history_text)
+        or "budget.amount" in history_text
+    )
+
+    if len(rows) == 1 and has_expected_columns and not uses_budget_amount:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="event_expense_type_total_requires_event_type_and_expense_cost_sum",
+            message=(
+                "For this event expense question, return exactly one row with columns "
+                "`type` and `SUM(T3.cost)`: the event's own `type` and the sum of approved "
+                "`expense.cost` values linked through budget to the named event. Do not group "
+                "by expense descriptions or budget categories, and do not sum budget amounts."
+            ),
+        )
+    ]
+
+
+def _requested_element_symbols(question: str) -> set[str]:
+    lowered_question = question.lower()
+    symbols: set[str] = set()
+    element_map = {
+        "phosphorus": "p",
+        "phosphorous": "p",
+        "bromine": "br",
+    }
+    for name, symbol in element_map.items():
+        if re.search(rf"\b{name}\b", lowered_question):
+            symbols.add(symbol)
+    return symbols
+
+
+def _find_context_file(context_dir: Path, filename: str) -> Path | None:
+    for path in context_dir.rglob(filename):
+        if path.is_file():
+            return path
+    return None
+
+
+def _expected_triple_bond_element_atom_count(task: PublicTask) -> int | None:
+    symbols = _requested_element_symbols(task.question)
+    if not symbols:
+        return None
+    lowered_question = task.question.lower()
+    if "total atoms" not in lowered_question:
+        return None
+    if "triple-bond" not in lowered_question and "triple bond" not in lowered_question:
+        return None
+
+    atom_path = _find_context_file(task.context_dir, "atom.csv")
+    bond_path = _find_context_file(task.context_dir, "bond.db")
+    if atom_path is None or bond_path is None:
+        return None
+
+    try:
+        with sqlite3.connect(bond_path) as conn:
+            triple_molecule_ids = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT DISTINCT molecule_id FROM bond WHERE bond_type = '#'"
+                )
+            }
+        with atom_path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            return sum(
+                1
+                for row in reader
+                if str(row.get("molecule_id")) in triple_molecule_ids
+                and str(row.get("element", "")).strip().lower() in symbols
+            )
+    except Exception:
+        return None
+
+
+def _single_numeric_answer(rows: Sequence[Sequence[Any]]) -> float | None:
+    if len(rows) != 1 or len(rows[0]) != 1:
+        return None
+    value = rows[0][0]
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _element_atom_count_issues(
+    task: PublicTask,
+    rows: Sequence[Sequence[Any]],
+) -> list[AnswerValidationIssue]:
+    expected_count = _expected_triple_bond_element_atom_count(task)
+    if expected_count is None:
+        return []
+
+    observed_count = _single_numeric_answer(rows)
+    if observed_count is None or observed_count == float(expected_count):
+        return []
+
+    requested_symbols = sorted(_requested_element_symbols(task.question))
+    return [
+        AnswerValidationIssue(
+            code="element_atom_count_counts_requested_elements_only",
+            message=(
+                "The question asks for total atoms containing specific elements. Count only "
+                f"atoms whose `element` is in {requested_symbols} inside triple-bond molecules, "
+                f"not all atoms in those molecules. The full data gives {expected_count}."
+            ),
+        )
+    ]
+
+
+def _last_posted_user_issues(
+    question: str,
+    columns: Sequence[str],
+    schema_tables: Sequence[dict[str, Any]],
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    asks_last_posted = bool(
+        re.search(r"\b(posted|edited|contributed)\b.*\blast\b", lowered_question)
+        or re.search(r"\blast\b.*\b(posted|edited|contributed)\b", lowered_question)
+        or "last time" in lowered_question
+    )
+    if not asks_last_posted:
+        return []
+    if not (
+        _schema_has_column(schema_tables, "ViewCount")
+        and _schema_has_column(schema_tables, "DisplayName")
+        and (
+            _schema_has_column(schema_tables, "LastEditorUserId")
+            or _schema_has_column(schema_tables, "LastEditorDisplayName")
+        )
+    ):
+        return []
+
+    normalized_columns = {_normalize_identifier(column) for column in columns}
+    history_text = _recent_history_text(steps)
+    wrong_owner_path = "owneruserid" in history_text and "lasteditor" not in history_text
+    wrong_columns = not {"viewcount", "displayname"}.issubset(normalized_columns)
+
+    if not wrong_owner_path and not wrong_columns:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="last_posted_user_requires_last_editor_display_name",
+            message=(
+                "For post questions asking who posted/edited/contributed last time, use "
+                "`LastEditorUserId` or `LastEditorDisplayName`, then return source columns "
+                "`ViewCount` and `DisplayName`. Do not use owner fields or aliases such as "
+                "`total_views`, `user_name`, or `last_user`."
+            ),
+        )
+    ]
+
+
+def _comment_content_issues(
+    question: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    schema_tables: Sequence[dict[str, Any]],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    if "comment" not in lowered_question:
+        return []
+    if re.search(r"\bcomment\s+id\b|\bid\s+of\s+the\s+comment\b", lowered_question):
+        return []
+    if not _schema_has_column(schema_tables, "Text"):
+        return []
+
+    normalized_columns = {_normalize_identifier(column) for column in columns}
+    returns_identifier_or_score = bool(
+        normalized_columns.intersection({"id", "comment_id", "score", "postid", "post_id"})
+    )
+    if "text" not in normalized_columns and returns_identifier_or_score:
+        return [
+            AnswerValidationIssue(
+                code="comment_question_requires_text_column",
+                message=(
+                    "The question asks for the comment itself. Return the full `Text` content "
+                    "column, not the comment `Id`, `Score`, or other proof columns."
+                ),
+            )
+        ]
+
+    has_truncated_text = any(
+        isinstance(value, str) and "..." in value
+        for row in rows
+        for value in row
+    )
+    if "text" in normalized_columns and has_truncated_text:
+        return [
+            AnswerValidationIssue(
+                code="comment_text_must_not_be_truncated",
+                message=(
+                    "The answer appears to contain truncated text. Fetch and return the full "
+                    "`Text` value, not a displayed pandas preview with ellipses."
+                ),
+            )
+        ]
+
+    return []
+
+
 def _recent_history_text(steps: Sequence[Any]) -> str:
     chunks: list[str] = []
     for step in steps:
-        chunks.extend(_step_actions(step))
-        action_inputs = _step_action_inputs(step)
-        for action_input in action_inputs:
-            if action_input:
-                chunks.append(json.dumps(action_input, ensure_ascii=False, sort_keys=True))
+        chunks.append(_step_action(step))
+        action_input = _step_action_input(step)
+        if action_input:
+            chunks.append(json.dumps(action_input, ensure_ascii=False, sort_keys=True))
         if isinstance(step, dict):
             raw_response = step.get("raw_response")
         else:

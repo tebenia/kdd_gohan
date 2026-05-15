@@ -208,6 +208,52 @@ def run_single_task(
     return _write_task_outputs(task_id, run_output_dir, run_result)
 
 
+def _worker_count_for_difficulty(difficulty: str, *, config: AppConfig) -> int:
+    normalized_difficulty = difficulty.strip().lower()
+    return max(config.run.difficulty_max_workers.get(normalized_difficulty, config.run.max_workers), 1)
+
+
+def _run_task_group(
+    *,
+    task_items: list[tuple[int, str]],
+    max_workers: int,
+    config: AppConfig,
+    run_output_dir: Path,
+    progress_callback: Callable[[TaskRunArtifacts], None] | None,
+    indexed_artifacts: list[TaskRunArtifacts | None],
+) -> None:
+    if max_workers < 1:
+        raise ValueError("max_workers must be at least 1.")
+
+    if max_workers == 1:
+        for index, task_id in task_items:
+            artifact = run_single_task(
+                task_id=task_id,
+                config=config,
+                run_output_dir=run_output_dir,
+            )
+            indexed_artifacts[index] = artifact
+            if progress_callback is not None:
+                progress_callback(artifact)
+        return
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(
+                run_single_task,
+                task_id=task_id,
+                config=config,
+                run_output_dir=run_output_dir,
+            ): index
+            for index, task_id in task_items
+        }
+        for future in as_completed(future_to_index):
+            artifact = future.result()
+            indexed_artifacts[future_to_index[future]] = artifact
+            if progress_callback is not None:
+                progress_callback(artifact)
+
+
 def run_benchmark(
     *,
     config: AppConfig,
@@ -223,16 +269,24 @@ def run_benchmark(
     if limit is not None:
         tasks = tasks[:limit]
 
-    effective_workers = config.run.max_workers
-    if effective_workers < 1:
+    if config.run.max_workers < 1:
         raise ValueError("max_workers must be at least 1.")
+    for difficulty, max_workers in config.run.difficulty_max_workers.items():
+        if max_workers < 1:
+            raise ValueError(f"difficulty_max_workers[{difficulty!r}] must be at least 1.")
+
     if model is not None or tools is not None:
         effective_workers = 1
+    else:
+        effective_workers = max(
+            [_worker_count_for_difficulty(task.difficulty, config=config) for task in tasks],
+            default=config.run.max_workers,
+        )
 
     task_ids = [task.task_id for task in tasks]
 
     task_artifacts: list[TaskRunArtifacts]
-    if effective_workers == 1:
+    if model is not None or tools is not None:
         shared_model = model or build_model_adapter(config)
         shared_tools = tools or create_default_tool_registry()
         task_artifacts = []
@@ -248,23 +302,22 @@ def run_benchmark(
             if progress_callback is not None:
                 progress_callback(artifact)
     else:
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            future_to_index = {
-                executor.submit(
-                    run_single_task,
-                    task_id=task_id,
-                    config=config,
-                    run_output_dir=run_output_dir,
-                ): index
-                for index, task_id in enumerate(task_ids)
-            }
-            indexed_artifacts: list[TaskRunArtifacts | None] = [None] * len(task_ids)
-            for future in as_completed(future_to_index):
-                artifact = future.result()
-                indexed_artifacts[future_to_index[future]] = artifact
-                if progress_callback is not None:
-                    progress_callback(artifact)
-            task_artifacts = [artifact for artifact in indexed_artifacts if artifact is not None]
+        grouped_task_items: dict[int, list[tuple[int, str]]] = {}
+        for index, task in enumerate(tasks):
+            max_workers = _worker_count_for_difficulty(task.difficulty, config=config)
+            grouped_task_items.setdefault(max_workers, []).append((index, task.task_id))
+
+        indexed_artifacts: list[TaskRunArtifacts | None] = [None] * len(task_ids)
+        for max_workers in sorted(grouped_task_items, reverse=True):
+            _run_task_group(
+                task_items=grouped_task_items[max_workers],
+                max_workers=max_workers,
+                config=config,
+                run_output_dir=run_output_dir,
+                progress_callback=progress_callback,
+                indexed_artifacts=indexed_artifacts,
+            )
+        task_artifacts = [artifact for artifact in indexed_artifacts if artifact is not None]
 
     summary_path = run_output_dir / "summary.json"
     _write_json(
@@ -274,6 +327,8 @@ def run_benchmark(
             "task_count": len(task_artifacts),
             "succeeded_task_count": sum(1 for artifact in task_artifacts if artifact.succeeded),
             "max_workers": effective_workers,
+            "default_max_workers": config.run.max_workers,
+            "difficulty_max_workers": config.run.difficulty_max_workers,
             "tasks": [artifact.to_dict() for artifact in task_artifacts],
         },
     )

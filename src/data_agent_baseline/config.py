@@ -36,6 +36,7 @@ class RunConfig:
     output_dir: Path = field(default_factory=_default_run_output_dir)
     run_id: str | None = None
     max_workers: int = 4
+    difficulty_max_workers: dict[str, int] = field(default_factory=lambda: {"hard": 1})
     task_timeout_seconds: int = 600
 
 
@@ -61,6 +62,24 @@ def _env_value(name: str) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _difficulty_worker_overrides(raw_value: object, default_value: dict[str, int]) -> dict[str, int]:
+    if raw_value is None:
+        return dict(default_value)
+    if not isinstance(raw_value, dict):
+        raise ValueError("run.difficulty_max_workers must be a mapping of difficulty names to integers.")
+
+    overrides: dict[str, int] = {}
+    for difficulty, workers in raw_value.items():
+        normalized_difficulty = str(difficulty).strip().lower()
+        if not normalized_difficulty:
+            raise ValueError("run.difficulty_max_workers cannot contain an empty difficulty name.")
+        worker_count = int(workers)
+        if worker_count < 1:
+            raise ValueError("run.difficulty_max_workers values must be at least 1.")
+        overrides[normalized_difficulty] = worker_count
+    return overrides
 
 
 def load_app_config(config_path: Path) -> AppConfig:
@@ -95,6 +114,10 @@ def load_app_config(config_path: Path) -> AppConfig:
         output_dir=_path_value(run_payload.get("output_dir"), run_defaults.output_dir),
         run_id=run_id,
         max_workers=int(run_payload.get("max_workers", run_defaults.max_workers)),
+        difficulty_max_workers=_difficulty_worker_overrides(
+            run_payload.get("difficulty_max_workers"),
+            run_defaults.difficulty_max_workers,
+        ),
         task_timeout_seconds=int(
             run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)
         ),

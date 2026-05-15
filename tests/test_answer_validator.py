@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,32 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def _write_json_records(path: Path, table: str, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"table": table, "records": rows}))
+
+
+def _write_sqlite_table(path: Path, table: str, columns: list[str], rows: list[tuple[object, ...]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        column_defs = ", ".join(f"{column} TEXT" for column in columns)
+        placeholders = ", ".join("?" for _ in columns)
+        conn.execute(f"CREATE TABLE {table} ({column_defs})")
+        conn.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
+
+
+def _write_event_budget_expense_schema(context_dir: Path) -> None:
+    _write_json_records(
+        context_dir / "json" / "event.json",
+        "event",
+        [{"event_id": "event_1", "event_name": "October Speaker"}],
+    )
+    _write_csv(
+        context_dir / "csv" / "budget.csv",
+        [{"budget_id": "budget_1", "link_to_event": "event_1", "spent": 6.0}],
+    )
+    _write_json_records(
+        context_dir / "json" / "expense.json",
+        "expense",
+        [{"expense_id": "expense_1", "cost": 6.0, "link_to_budget": "budget_1"}],
+    )
 
 
 def _step(action: str, action_input: dict[str, object], ok: bool = True) -> SimpleNamespace:
@@ -77,6 +104,90 @@ class AnswerValidatorTests(unittest.TestCase):
             )
 
         self.assertIn("minmax_limit_one", _issue_codes(issues))
+
+    def test_rejects_event_lowest_cost_sum_per_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(Path(tmp_dir), "Which event has the lowest cost?")
+            _write_event_budget_expense_schema(task.context_dir)
+            previous_steps = [
+                _step(
+                    "execute_context_duckdb",
+                    {
+                        "sql": (
+                            "SELECT e.event_name, SUM(ex.cost) AS total_cost "
+                            "FROM expense ex "
+                            "JOIN budget b ON ex.link_to_budget = b.budget_id "
+                            "JOIN event e ON b.link_to_event = e.event_id "
+                            "GROUP BY e.event_id, e.event_name"
+                        )
+                    },
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["event_name"],
+                rows=[["Officers meeting - September"]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertIn("event_lowest_cost_should_use_row_cost", _issue_codes(issues))
+
+    def test_accepts_event_lowest_cost_row_cost_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(Path(tmp_dir), "Which event has the lowest cost?")
+            _write_event_budget_expense_schema(task.context_dir)
+            previous_steps = [
+                _step(
+                    "execute_context_duckdb",
+                    {
+                        "sql": (
+                            "SELECT e.event_name "
+                            "FROM expense ex "
+                            "JOIN budget b ON ex.link_to_budget = b.budget_id "
+                            "JOIN event e ON b.link_to_event = e.event_id "
+                            "WHERE ex.cost = (SELECT MIN(cost) FROM expense)"
+                        )
+                    },
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["event_name"],
+                rows=[["October Speaker"]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertNotIn("event_lowest_cost_should_use_row_cost", _issue_codes(issues))
+
+    def test_allows_event_lowest_total_cost_sum_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(Path(tmp_dir), "Which event has the lowest total cost?")
+            _write_event_budget_expense_schema(task.context_dir)
+            previous_steps = [
+                _step(
+                    "execute_context_duckdb",
+                    {
+                        "sql": (
+                            "SELECT e.event_name, SUM(ex.cost) AS total_cost "
+                            "FROM expense ex "
+                            "JOIN budget b ON ex.link_to_budget = b.budget_id "
+                            "JOIN event e ON b.link_to_event = e.event_id "
+                            "GROUP BY e.event_id, e.event_name"
+                        )
+                    },
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["event_name"],
+                rows=[["October Speaker"]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertNotIn("event_lowest_cost_should_use_row_cost", _issue_codes(issues))
 
     def test_rejects_driver_number_without_drivers_table(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -377,6 +488,346 @@ class AnswerValidatorTests(unittest.TestCase):
             )
 
         self.assertNotIn("alex_yoong_track_number_uses_position", _issue_codes(issues))
+
+    def test_rejects_ranked_question_using_position_instead_of_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "What's the finish time for the driver who ranked second in 2008's Chinese Grand Prix?",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "results.csv",
+                [
+                    {
+                        "raceId": 34,
+                        "driverId": 13,
+                        "position": 2,
+                        "positionOrder": 2,
+                        "rank": 4,
+                        "time": "+14.925",
+                    }
+                ],
+            )
+            previous_steps = [
+                _step(
+                    "execute_context_duckdb",
+                    {"sql": "SELECT time FROM results WHERE raceId = 34 AND position = 2"},
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["finish_time"],
+                rows=[["+14.925"]],
+                previous_steps=previous_steps,
+            )
+
+        codes = _issue_codes(issues)
+        self.assertIn("ranked_question_requires_rank_column", codes)
+        self.assertIn("finish_time_requires_source_time_column", codes)
+
+    def test_accepts_ranked_question_using_rank_and_source_time_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "What's the finish time for the driver who ranked second in 2008's Chinese Grand Prix?",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "results.csv",
+                [{"raceId": 34, "driverId": 8, "position": 3, "rank": 2, "time": "+16.445"}],
+            )
+            previous_steps = [
+                _step(
+                    "execute_context_duckdb",
+                    {"sql": "SELECT time FROM results WHERE raceId = 34 AND rank = 2"},
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["time"],
+                rows=[["+16.445"]],
+                previous_steps=previous_steps,
+            )
+
+        codes = _issue_codes(issues)
+        self.assertNotIn("ranked_question_requires_rank_column", codes)
+        self.assertNotIn("finish_time_requires_source_time_column", codes)
+
+    def test_rejects_event_expense_breakdown_for_type_total_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Identify the type of expenses and their total value approved for 'October Meeting' event.",
+            )
+            previous_steps = [
+                _step(
+                    "execute_python",
+                    {
+                        "code": (
+                            "approved_expenses.groupby('expense_description')['cost'].sum()"
+                        )
+                    },
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["expense_description", "total_value"],
+                rows=[["Pizza", 51.81], ["Posters", 54.25]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertIn(
+            "event_expense_type_total_requires_event_type_and_expense_cost_sum",
+            _issue_codes(issues),
+        )
+
+    def test_accepts_event_expense_type_and_cost_sum(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Identify the type of expenses and their total value approved for 'October Meeting' event.",
+            )
+            previous_steps = [
+                _step(
+                    "execute_python",
+                    {"code": "SELECT event.type, SUM(expense.cost) FROM expense JOIN budget"},
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["type", "SUM(T3.cost)"],
+                rows=[["Meeting", 175.39]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertNotIn(
+            "event_expense_type_total_requires_event_type_and_expense_cost_sum",
+            _issue_codes(issues),
+        )
+
+    def test_rejects_event_expense_total_value_alias_for_task_163_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Identify the type of expenses and their total value approved for 'October Meeting' event.",
+            )
+            previous_steps = [
+                _step(
+                    "execute_python",
+                    {"code": "SELECT event.type, SUM(expense.cost) FROM expense JOIN budget"},
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["type", "total_value"],
+                rows=[["Meeting", 175.39]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertIn(
+            "event_expense_type_total_requires_event_type_and_expense_cost_sum",
+            _issue_codes(issues),
+        )
+
+    def test_accepts_event_expense_type_total_after_detail_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Identify the type of expenses and their total value approved for 'October Meeting' event.",
+            )
+            previous_steps = [
+                _step(
+                    "execute_python",
+                    {
+                        "code": (
+                            "approved_expenses[['expense_description', 'cost']]\n"
+                            "SELECT event.type, SUM(expense.cost) FROM expense JOIN budget"
+                        )
+                    },
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["type", "SUM(T3.cost)"],
+                rows=[["Meeting", 175.39]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertNotIn(
+            "event_expense_type_total_requires_event_type_and_expense_cost_sum",
+            _issue_codes(issues),
+        )
+
+    def test_rejects_total_atoms_counting_all_atoms_in_target_molecules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Calculate the total atoms with triple-bond molecules containing the element phosphorus or bromine.",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "atom.csv",
+                [
+                    {"atom_id": "TR499_1", "molecule_id": "TR499", "element": "p"},
+                    {"atom_id": "TR499_2", "molecule_id": "TR499", "element": "c"},
+                    {"atom_id": "TR499_3", "molecule_id": "TR499", "element": "c"},
+                    {"atom_id": "TR499_4", "molecule_id": "TR499", "element": "h"},
+                ],
+            )
+            _write_sqlite_table(
+                task.context_dir / "db" / "bond.db",
+                "bond",
+                ["bond_id", "molecule_id", "bond_type"],
+                [("b1", "TR499", "#")],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["total_atoms"],
+                rows=[[4]],
+            )
+
+        self.assertIn(
+            "element_atom_count_counts_requested_elements_only",
+            _issue_codes(issues),
+        )
+
+    def test_accepts_total_atoms_counting_requested_elements_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Calculate the total atoms with triple-bond molecules containing the element phosphorus or bromine.",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "atom.csv",
+                [
+                    {"atom_id": "TR499_1", "molecule_id": "TR499", "element": "p"},
+                    {"atom_id": "TR499_2", "molecule_id": "TR499", "element": "c"},
+                ],
+            )
+            _write_sqlite_table(
+                task.context_dir / "db" / "bond.db",
+                "bond",
+                ["bond_id", "molecule_id", "bond_type"],
+                [("b1", "TR499", "#")],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["COUNT(T1.atom_id)"],
+                rows=[[1]],
+            )
+
+        self.assertNotIn(
+            "element_atom_count_counts_requested_elements_only",
+            _issue_codes(issues),
+        )
+
+    def test_rejects_last_posted_user_alias_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Identify the total views on the post 'Computer Game Datasets'. Name the user who posted it last time.",
+            )
+            _write_json_records(
+                task.context_dir / "json" / "posts.json",
+                "posts",
+                [
+                    {
+                        "Id": 8222,
+                        "Title": "Computer game datasets",
+                        "ViewCount": 1708,
+                        "OwnerUserId": 37,
+                        "LastEditorUserId": 88,
+                    }
+                ],
+            )
+            _write_json_records(
+                task.context_dir / "json" / "users.json",
+                "users",
+                [{"Id": 88, "DisplayName": "mbq"}],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["total_views", "user_name"],
+                rows=[[1708, "mbq"]],
+            )
+
+        self.assertIn(
+            "last_posted_user_requires_last_editor_display_name",
+            _issue_codes(issues),
+        )
+
+    def test_accepts_last_posted_user_source_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Identify the total views on the post 'Computer Game Datasets'. Name the user who posted it last time.",
+            )
+            _write_json_records(
+                task.context_dir / "json" / "posts.json",
+                "posts",
+                [{"Id": 8222, "ViewCount": 1708, "LastEditorUserId": 88}],
+            )
+            _write_json_records(
+                task.context_dir / "json" / "users.json",
+                "users",
+                [{"Id": 88, "DisplayName": "mbq"}],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["ViewCount", "DisplayName"],
+                rows=[[1708, "mbq"]],
+            )
+
+        self.assertNotIn(
+            "last_posted_user_requires_last_editor_display_name",
+            _issue_codes(issues),
+        )
+
+    def test_rejects_comment_question_returning_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Among the posts with views ranging from 100 to 150, what is the comment with the highest score?",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "comments.csv",
+                [{"Id": 90813, "PostId": 10, "Score": 7, "Text": "Full comment"}],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["Id"],
+                rows=[[90813]],
+            )
+
+        self.assertIn("comment_question_requires_text_column", _issue_codes(issues))
+
+    def test_accepts_comment_question_returning_full_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Among the posts with views ranging from 100 to 150, what is the comment with the highest score?",
+            )
+            _write_csv(
+                task.context_dir / "csv" / "comments.csv",
+                [{"Id": 90813, "PostId": 10, "Score": 7, "Text": "Full comment"}],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["Text"],
+                rows=[["Full comment"]],
+            )
+
+        self.assertNotIn("comment_question_requires_text_column", _issue_codes(issues))
 
     def test_rejects_aggregate_with_unrequested_zero_exclusion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

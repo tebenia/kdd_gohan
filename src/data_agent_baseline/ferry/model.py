@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-import httpx ## httpx is new
-from openai import APIError, OpenAI ##APIError is new
+import httpx
+from openai import APIError, OpenAI
 
 
 @dataclass(frozen=True, slots=True)

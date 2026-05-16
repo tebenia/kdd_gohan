@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import multiprocessing
+import queue as queue_module
 import re
 import signal
 import threading
@@ -18,8 +21,13 @@ class _StepTimeoutError(Exception):
 def _alarm_handler(_signum: int, _frame: object) -> None:
     raise _StepTimeoutError("Model API call timed out (SIGALRM)")
 
-import concurrent.futures
-from data_agent_baseline.agents.model import ModelAdapter, ModelMessage, ModelStep, ModelAction
+from data_agent_baseline.agents.model import (
+    ModelAdapter,
+    ModelMessage,
+    ModelStep,
+    ModelAction,
+    OpenAIModelAdapter,
+)
 from data_agent_baseline.agents.prompt import (
     REACT_SYSTEM_PROMPT,
     build_observation_prompt,
@@ -34,6 +42,71 @@ from data_agent_baseline.tools.registry import ToolRegistry
 @dataclass(frozen=True, slots=True)
 class ReActAgentConfig:
     max_steps: int = 16
+    model_call_timeout_seconds: int = 60
+
+
+def _complete_model_worker(
+    model: ModelAdapter,
+    messages: list[ModelMessage],
+    queue: multiprocessing.Queue,
+) -> None:
+    try:
+        queue.put({"ok": True, "raw_response": model.complete(messages)})
+    except BaseException as exc:  # noqa: BLE001
+        queue.put(
+            {
+                "ok": False,
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
+        )
+
+
+def _complete_model_with_process_timeout(
+    model: ModelAdapter,
+    messages: list[ModelMessage],
+    *,
+    timeout_seconds: int,
+) -> str:
+    if timeout_seconds <= 0:
+        return model.complete(messages)
+
+    queue: multiprocessing.Queue = multiprocessing.Queue()
+    process = multiprocessing.Process(
+        target=_complete_model_worker,
+        args=(model, messages, queue),
+    )
+    process.start()
+    process.join(timeout_seconds)
+
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1.0)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        raise RuntimeError(
+            f"Model API call timed out after {timeout_seconds}s "
+            "(process-level timeout; subprocess was terminated)."
+        )
+
+    try:
+        result = queue.get(timeout=1.0)
+    except queue_module.Empty:
+        exit_code = process.exitcode
+        if exit_code not in (None, 0):
+            raise RuntimeError(f"Model API call subprocess exited with code {exit_code}.")
+        raise RuntimeError("Model API call subprocess exited without returning a response.")
+
+    if result.get("ok"):
+        raw_response = result.get("raw_response")
+        if not isinstance(raw_response, str):
+            raise RuntimeError("Model API call subprocess returned non-string response.")
+        return raw_response
+
+    error_type = result.get("error_type", "Error")
+    error = result.get("error", "unknown error")
+    raise RuntimeError(f"Model API call subprocess failed with {error_type}: {error}")
 
 
 def _strip_json_fence(raw_response: str) -> str:
@@ -140,8 +213,9 @@ class ReActAgent:
         messages = [ModelMessage(role="system", content=system_content)]
         messages.append(ModelMessage(role="user", content=build_task_prompt(task)))
 
-        # DAG Phase 1 — PLAN: inject planning prompt before the very first step
-        if not state.steps:
+        # DAG Phase 1 — PLAN: keep this active until the first real model step.
+        # A model-call timeout records an __error__ step, but no plan was produced.
+        if not state.steps or all(step.action == "__error__" for step in state.steps):
             messages.append(ModelMessage(
                 role="user",
                 content=(
@@ -178,7 +252,8 @@ class ReActAgent:
                     knowledge_content = obs.get("content")
         
         for i, step in enumerate(state.steps):
-            messages.append(ModelMessage(role="assistant", content=step.raw_response))
+            if step.raw_response:
+                messages.append(ModelMessage(role="assistant", content=step.raw_response))
             
             is_recent = i >= len(state.steps) - 3
             obs_list = step.observation if isinstance(step.observation, list) else [step.observation]
@@ -258,51 +333,62 @@ class ReActAgent:
 
         return messages
 
-    # Hard per-step timeout on top of the httpx timeout.
-    # In practice, OpenRouter can accept the TCP connection but never send data,
-    # causing model.complete() to hang indefinitely despite timeout=90s on the client.
-    # This Python-level timeout ensures each step fails fast so the task can retry
-    # or exhaust max_steps rather than blocking a worker for the full task timeout.
-    # SIGALRM fires at OS level and can interrupt blocking socket/SSL reads
-    # that Python's thread.join(timeout) cannot interrupt in subprocess context.
-    # Falls back to daemon-thread join on non-UNIX platforms (Windows).
-    _PER_STEP_TIMEOUT = 60  # seconds
+    def _complete_model_with_signal_timeout(self, messages: list[ModelMessage]) -> str:
+        # Fallback path for scripted/custom models. Real OpenAIModelAdapter calls use
+        # the process timeout below so a wedged TLS/socket call can be killed.
+        if self.config.model_call_timeout_seconds <= 0:
+            return self.model.complete(messages)
+
+        if _SIGALRM_SUPPORTED:
+            signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.alarm(self.config.model_call_timeout_seconds)
+            try:
+                return self.model.complete(messages)
+            finally:
+                signal.alarm(0)
+
+        _result: list[str] = []
+        _error: list[BaseException] = []
+
+        def _call() -> None:
+            try:
+                _result.append(self.model.complete(messages))
+            except BaseException as _e:
+                _error.append(_e)
+
+        _t = threading.Thread(target=_call, daemon=True)
+        _t.start()
+        _t.join(timeout=self.config.model_call_timeout_seconds)
+        if _t.is_alive():
+            raise RuntimeError(
+                f"Model API call timed out after {self.config.model_call_timeout_seconds}s "
+                "(thread-level timeout)."
+            )
+        if _error:
+            raise _error[0]
+        if not _result:
+            raise RuntimeError("Model API call finished without returning a response.")
+        return _result[0]
+
+    def _complete_model(self, messages: list[ModelMessage]) -> str:
+        # The benchmark already runs each task in a subprocess, but a hung first
+        # model request used to block that whole task until task_timeout_seconds.
+        # Running the API call in its own subprocess turns that into a retryable
+        # per-step error instead.
+        if isinstance(self.model, OpenAIModelAdapter):
+            return _complete_model_with_process_timeout(
+                self.model,
+                messages,
+                timeout_seconds=self.config.model_call_timeout_seconds,
+            )
+        return self._complete_model_with_signal_timeout(messages)
 
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
         for step_index in range(1, self.config.max_steps + 1):
             raw_response = ""
             try:
-                if _SIGALRM_SUPPORTED:
-                    # Primary timeout: SIGALRM interrupts blocking socket/SSL at OS level.
-                    signal.signal(signal.SIGALRM, _alarm_handler)
-                    signal.alarm(self._PER_STEP_TIMEOUT)
-                    try:
-                        raw_response = self.model.complete(self._build_messages(task, state))
-                    finally:
-                        signal.alarm(0)  # Cancel alarm regardless of success or exception
-                else:
-                    # Fallback for non-UNIX: daemon thread with join timeout.
-                    _result: list[str] = []
-                    _error: list[BaseException] = []
-
-                    def _call() -> None:
-                        try:
-                            _result.append(self.model.complete(self._build_messages(task, state)))
-                        except BaseException as _e:
-                            _error.append(_e)
-
-                    _t = threading.Thread(target=_call, daemon=True)
-                    _t.start()
-                    _t.join(timeout=self._PER_STEP_TIMEOUT)
-                    if _t.is_alive():
-                        raise RuntimeError(
-                            f"Model API call timed out after {self._PER_STEP_TIMEOUT}s "
-                            "(thread-level timeout)."
-                        )
-                    if _error:
-                        raise _error[0]
-                    raw_response = _result[0]
+                raw_response = self._complete_model(self._build_messages(task, state))
                 model_step = parse_model_step(raw_response)
                 
                 observations = []

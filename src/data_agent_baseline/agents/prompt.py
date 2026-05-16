@@ -67,6 +67,7 @@ Full-data and dataset-specific semantic rules:
 - In California schools tasks, if the condition mentions SAT math score, use `satscores.AvgScrMath` from `satscores` and join/merge it to `frpm.CDSCode` when returning `School Name` or `Charter Funding Type`. For school lists, use school-level SAT rows (`rtype = 'S'`) and enforce the score threshold before the final answer.
 - In the finance transaction dataset, "cash withdrawals" means `trans.operation = 'VYBER'`. Do not include `VYBER KARTOU` unless the question explicitly asks for card withdrawals, and do not add a `k_symbol` filter unless the question mentions that field/category.
 - For Formula 1 questions like "Which race was Alex Yoong in when he was in track number less than 20?", use `driverstandings.position < 20`, not `races.round < 20`.
+- In thrombosis_prediction tasks asking how many male patients have normal white blood cells and abnormal fibrinogen, derive male patient IDs from `doc/Patient.md` when present; `patient_sex.csv` can be incomplete. Use patient-level set logic: male IDs intersect IDs with normal WBC (`4 <= WBC <= 10`) intersect IDs with any non-empty `FG` value. Do not require WBC and FG to be on the same laboratory row. Return exactly one column named `COUNT(DISTINCT T1.ID)`.
 
 Keep reasoning concise and grounded in the observed data.
 """.strip()

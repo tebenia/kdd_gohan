@@ -60,6 +60,32 @@ def _write_event_budget_expense_schema(context_dir: Path) -> None:
     )
 
 
+def _write_thrombosis_wbc_fibrinogen_context(context_dir: Path) -> None:
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    (doc_dir / "Patient.md").write_text(
+        "\n\n".join(
+            [
+                "Patient 1001 is a male subject whose chart was opened in 1994.",
+                "Patient 1002 is a male subject whose chart was opened in 1995.",
+                "Patient 1003 is a male subject whose chart was opened in 1996.",
+                "Patient 1004 is a female subject whose chart was opened in 1997.",
+            ]
+        )
+    )
+    _write_csv(
+        context_dir / "csv" / "Laboratory.csv",
+        [
+            {"ID": "1001", "Date": "1994-01-01", "WBC": "5.0", "FG": ""},
+            {"ID": "1001", "Date": "1994-01-02", "WBC": "", "FG": "31.3"},
+            {"ID": "1002", "Date": "1994-01-03", "WBC": "6.0", "FG": "35.0"},
+            {"ID": "1003", "Date": "1994-01-04", "WBC": "12.0", "FG": "34.0"},
+            {"ID": "1004", "Date": "1994-01-05", "WBC": "6.0", "FG": "33.0"},
+        ],
+    )
+    _write_csv(context_dir / "patient_sex.csv", [{"ID": "1002", "SEX": "M"}])
+
+
 def _step(action: str, action_input: dict[str, object], ok: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         action=action,
@@ -488,6 +514,72 @@ class AnswerValidatorTests(unittest.TestCase):
             )
 
         self.assertNotIn("alex_yoong_track_number_uses_position", _issue_codes(issues))
+
+    def test_rejects_thrombosis_wbc_fibrinogen_same_row_or_patient_sex_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                (
+                    "Among the male patients who have a normal level of white blood cells, "
+                    "how many of them have an abnormal fibrinogen level?"
+                ),
+            )
+            _write_thrombosis_wbc_fibrinogen_context(task.context_dir)
+
+            issues = validate_answer(
+                task,
+                columns=["count"],
+                rows=[[1]],
+            )
+
+        self.assertIn(
+            "thrombosis_wbc_fibrinogen_patient_level_count",
+            _issue_codes(issues),
+        )
+
+    def test_rejects_thrombosis_wbc_fibrinogen_correct_count_with_alias_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                (
+                    "Among the male patients who have a normal level of white blood cells, "
+                    "how many of them have an abnormal fibrinogen level?"
+                ),
+            )
+            _write_thrombosis_wbc_fibrinogen_context(task.context_dir)
+
+            issues = validate_answer(
+                task,
+                columns=["count"],
+                rows=[[2]],
+            )
+
+        self.assertIn(
+            "thrombosis_wbc_fibrinogen_patient_level_count",
+            _issue_codes(issues),
+        )
+
+    def test_accepts_thrombosis_wbc_fibrinogen_patient_level_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                (
+                    "Among the male patients who have a normal level of white blood cells, "
+                    "how many of them have an abnormal fibrinogen level?"
+                ),
+            )
+            _write_thrombosis_wbc_fibrinogen_context(task.context_dir)
+
+            issues = validate_answer(
+                task,
+                columns=["COUNT(DISTINCT T1.ID)"],
+                rows=[[2]],
+            )
+
+        self.assertNotIn(
+            "thrombosis_wbc_fibrinogen_patient_level_count",
+            _issue_codes(issues),
+        )
 
     def test_rejects_ranked_question_using_position_instead_of_rank(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

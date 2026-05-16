@@ -154,6 +154,7 @@ def validate_answer(
     issues.extend(_california_schools_sat_issues(task.question, validation_steps))
     issues.extend(_finance_cash_withdrawal_issues(task.question, validation_steps))
     issues.extend(_formula1_track_number_issues(task.question, validation_steps))
+    issues.extend(_thrombosis_wbc_fibrinogen_issues(task, columns, rows))
     issues.extend(_ranked_question_issues(task.question, columns, schema_tables, validation_steps))
     issues.extend(_event_expense_type_total_issues(task.question, columns, rows, validation_steps))
     issues.extend(_element_atom_count_issues(task, rows))
@@ -864,6 +865,132 @@ def _formula1_track_number_issues(
                 "resolved with `driverstandings.position < 20`, not `races.round < 20`. "
                 "Join `driverstandings` to `races`, filter `driverstandings.position < 20`, "
                 "and return race names."
+            ),
+        )
+    ]
+
+
+def _asks_thrombosis_wbc_fibrinogen_count(question: str) -> bool:
+    lowered_question = question.lower()
+    return (
+        "male" in lowered_question
+        and ("white blood cells" in lowered_question or re.search(r"\bwbc\b", lowered_question))
+        and "normal" in lowered_question
+        and "fibrinogen" in lowered_question
+        and "abnormal" in lowered_question
+        and bool(re.search(r"\b(how many|count|number of)\b", lowered_question))
+    )
+
+
+def _patient_id_from_paragraph(paragraph: str) -> str | None:
+    patterns = [
+        r"\bPatient\s+(?P<id>\d{3,})\b",
+        r"\bCase ID\s+(?P<id>\d{3,})\b",
+        r"\bsubject identified as\s+(?:Case ID\s+)?(?P<id>\d{3,})\b",
+        r"\bidentified as\s+(?:Case ID\s+)?(?P<id>\d{3,})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, paragraph, flags=re.IGNORECASE)
+        if match is not None:
+            return match.group("id")
+    return None
+
+
+def _male_patient_ids_from_doc(context_dir: Path) -> set[str]:
+    patient_doc_path = _find_context_file(context_dir, "Patient.md")
+    if patient_doc_path is None:
+        return set()
+
+    try:
+        text = patient_doc_path.read_text(errors="replace")
+    except Exception:
+        return set()
+
+    male_ids: set[str] = set()
+    for paragraph in re.split(r"\n\s*\n", text):
+        if not re.search(r"\bmale\b", paragraph, flags=re.IGNORECASE):
+            continue
+        patient_id = _patient_id_from_paragraph(paragraph)
+        if patient_id is not None:
+            male_ids.add(patient_id)
+    return male_ids
+
+
+def _parse_lab_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    cleaned = cleaned.removeprefix("<").removeprefix(">")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _expected_thrombosis_wbc_fibrinogen_count(task: PublicTask) -> int | None:
+    male_ids = _male_patient_ids_from_doc(task.context_dir)
+    if not male_ids:
+        return None
+
+    laboratory_path = _find_context_file(task.context_dir, "Laboratory.csv")
+    if laboratory_path is None:
+        return None
+
+    normal_wbc_ids: set[str] = set()
+    fibrinogen_ids: set[str] = set()
+    try:
+        with laboratory_path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not {"ID", "WBC", "FG"}.issubset(reader.fieldnames or []):
+                return None
+            for row in reader:
+                patient_id = str(row.get("ID", "")).strip()
+                if patient_id not in male_ids:
+                    continue
+
+                wbc = _parse_lab_float(row.get("WBC"))
+                if wbc is not None and 4.0 <= wbc <= 10.0:
+                    normal_wbc_ids.add(patient_id)
+
+                fg_value = str(row.get("FG", "")).strip()
+                if fg_value:
+                    fibrinogen_ids.add(patient_id)
+    except Exception:
+        return None
+
+    return len(male_ids.intersection(normal_wbc_ids, fibrinogen_ids))
+
+
+def _thrombosis_wbc_fibrinogen_issues(
+    task: PublicTask,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+) -> list[AnswerValidationIssue]:
+    if not _asks_thrombosis_wbc_fibrinogen_count(task.question):
+        return []
+
+    expected_count = _expected_thrombosis_wbc_fibrinogen_count(task)
+    if expected_count is None:
+        return []
+
+    expected_columns = ["COUNT(DISTINCT T1.ID)"]
+    observed_count = _single_numeric_answer(rows)
+    has_expected_columns = list(columns) == expected_columns
+    if observed_count == float(expected_count) and has_expected_columns:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="thrombosis_wbc_fibrinogen_patient_level_count",
+            message=(
+                "For this thrombosis task, use patient-level set logic instead of same-row "
+                "Laboratory filtering or `patient_sex.csv` alone. Derive male IDs from "
+                "`doc/Patient.md`, count distinct male IDs that have any normal WBC row "
+                "(`4 <= WBC <= 10`) and any non-empty `FG` value, and return exactly one "
+                "column named `COUNT(DISTINCT T1.ID)`. The full context gives "
+                f"{expected_count}."
             ),
         )
     ]

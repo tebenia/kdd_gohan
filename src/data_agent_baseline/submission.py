@@ -37,6 +37,7 @@ class SubmissionConfig:
     max_workers: int
     difficulty_max_workers: dict[str, int]
     task_timeout_seconds: int
+    write_traces: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,7 @@ class SubmissionTaskResult:
     prediction_path: str | None
     elapsed_seconds: float
     failure_reason: str | None = None
+    trace_path: str | None = None
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -67,6 +69,13 @@ def _env_int_optional(name: str) -> int | None:
     if not value or not value.strip():
         return None
     return int(value.strip())
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _difficulty_worker_overrides() -> dict[str, int]:
@@ -94,6 +103,7 @@ def load_submission_config() -> SubmissionConfig:
         max_workers=max(_env_int("SUBMISSION_MAX_WORKERS", 4), 1),
         difficulty_max_workers=_difficulty_worker_overrides(),
         task_timeout_seconds=_env_int("SUBMISSION_TASK_TIMEOUT_SECONDS", 600),
+        write_traces=_env_bool("SUBMISSION_WRITE_TRACES", False),
     )
 
 
@@ -192,6 +202,24 @@ def write_empty_prediction(output_root: Path, task_id: str) -> Path:
     return prediction_path
 
 
+def write_trace(log_root: Path, task_id: str, payload: dict[str, Any]) -> Path:
+    trace_dir = log_root / "traces" / task_id
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / "trace.json"
+    trace_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    return trace_path
+
+
+def _failure_trace_payload(task_id: str, failure_reason: str) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "answer": None,
+        "steps": [],
+        "failure_reason": failure_reason,
+        "succeeded": False,
+    }
+
+
 def process_task_core(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResult:
     started_at = perf_counter()
     task_id = task_dir.name
@@ -199,6 +227,11 @@ def process_task_core(task_dir: Path, config: SubmissionConfig) -> SubmissionTas
         task = load_public_task(task_dir)
         agent = build_agent(config)
         result = agent.run(task)
+        trace_path = (
+            write_trace(config.log_root, task.task_id, result.to_dict())
+            if config.write_traces
+            else None
+        )
         if result.answer is None:
             prediction_path = write_empty_prediction(config.output_root, task.task_id)
             failure_reason = result.failure_reason or "Agent did not submit an answer."
@@ -208,6 +241,7 @@ def process_task_core(task_dir: Path, config: SubmissionConfig) -> SubmissionTas
                 prediction_path=str(prediction_path),
                 elapsed_seconds=round(perf_counter() - started_at, 3),
                 failure_reason=failure_reason,
+                trace_path=str(trace_path) if trace_path is not None else None,
             )
 
         prediction_path = write_prediction(config.output_root, task.task_id, result.answer)
@@ -216,15 +250,23 @@ def process_task_core(task_dir: Path, config: SubmissionConfig) -> SubmissionTas
             succeeded=True,
             prediction_path=str(prediction_path),
             elapsed_seconds=round(perf_counter() - started_at, 3),
+            trace_path=str(trace_path) if trace_path is not None else None,
         )
     except BaseException as exc:  # noqa: BLE001
+        failure_reason = str(exc)
         prediction_path = write_empty_prediction(config.output_root, task_id)
+        trace_path = (
+            write_trace(config.log_root, task_id, _failure_trace_payload(task_id, failure_reason))
+            if config.write_traces
+            else None
+        )
         return SubmissionTaskResult(
             task_id=task_id,
             succeeded=False,
             prediction_path=str(prediction_path),
             elapsed_seconds=round(perf_counter() - started_at, 3),
-            failure_reason=str(exc),
+            failure_reason=failure_reason,
+            trace_path=str(trace_path) if trace_path is not None else None,
         )
 
 
@@ -281,25 +323,39 @@ def process_task(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResu
 
     if process.is_alive():
         terminate_task_process(process)
+        failure_reason = f"Task timed out after {timeout_seconds} seconds."
         prediction_path = write_empty_prediction(config.output_root, task_id)
+        trace_path = (
+            write_trace(config.log_root, task_id, _failure_trace_payload(task_id, failure_reason))
+            if config.write_traces
+            else None
+        )
         return SubmissionTaskResult(
             task_id=task_id,
             succeeded=False,
             prediction_path=str(prediction_path),
             elapsed_seconds=round(perf_counter() - started_at, 3),
-            failure_reason=f"Task timed out after {timeout_seconds} seconds.",
+            failure_reason=failure_reason,
+            trace_path=str(trace_path) if trace_path is not None else None,
         )
 
     try:
         payload = queue.get(timeout=1.0)
     except Empty:
+        failure_reason = f"Task exited without returning a result (exit_code={process.exitcode})."
         prediction_path = write_empty_prediction(config.output_root, task_id)
+        trace_path = (
+            write_trace(config.log_root, task_id, _failure_trace_payload(task_id, failure_reason))
+            if config.write_traces
+            else None
+        )
         return SubmissionTaskResult(
             task_id=task_id,
             succeeded=False,
             prediction_path=str(prediction_path),
             elapsed_seconds=round(perf_counter() - started_at, 3),
-            failure_reason=f"Task exited without returning a result (exit_code={process.exitcode}).",
+            failure_reason=failure_reason,
+            trace_path=str(trace_path) if trace_path is not None else None,
         )
 
     return SubmissionTaskResult(**payload)
@@ -361,7 +417,7 @@ def run_submission(config: SubmissionConfig) -> int:
         f"Starting submission run input={config.input_root} output={config.output_root} "
         f"model={config.model_name} max_steps={config.max_steps} "
         f"max_workers={config.max_workers} difficulty_max_workers={config.difficulty_max_workers} "
-        f"task_timeout_seconds={config.task_timeout_seconds}",
+        f"task_timeout_seconds={config.task_timeout_seconds} write_traces={config.write_traces}",
         flush=True,
     )
     task_dirs = iter_task_dirs(config.input_root)
@@ -388,6 +444,7 @@ def run_submission(config: SubmissionConfig) -> int:
         "stopped_early": STOP_REQUESTED,
         "default_max_workers": config.max_workers,
         "difficulty_max_workers": config.difficulty_max_workers,
+        "write_traces": config.write_traces,
         "worker_group_counts": {
             str(max_workers): len(grouped_task_dirs[max_workers])
             for max_workers in sorted(grouped_task_dirs, reverse=True)

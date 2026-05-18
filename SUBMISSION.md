@@ -17,6 +17,7 @@ and writes:
 /output/task_<id>/prediction.csv
 /logs/runtime.log
 /logs/summary.json
+/logs/traces/task_<id>/trace.json  # optional, local debugging only
 ```
 
 Model configuration is read only from runtime environment variables:
@@ -27,6 +28,7 @@ MODEL_API_KEY
 MODEL_NAME
 SUBMISSION_MAX_WORKERS
 SUBMISSION_TASK_TIMEOUT_SECONDS
+SUBMISSION_WRITE_TRACES
 ```
 
 Local-only data, artifacts, notebooks, virtual environments, and local config files are excluded by `.dockerignore`.
@@ -64,6 +66,7 @@ export MODEL_API_KEY="your-api-key"
 export MODEL_NAME="qwen3.5-35b-a3b"
 export SUBMISSION_MAX_WORKERS=8
 export SUBMISSION_TASK_TIMEOUT_SECONDS=600
+export SUBMISSION_WRITE_TRACES=1
 ```
 
 Run:
@@ -72,7 +75,7 @@ Run:
 ./scripts/test_submission_container.sh team0042:v3
 ```
 
-The script mounts local public demo input into `/input`, writes predictions under `tmp_submission_test/output`, and logs under `tmp_submission_test/logs`.
+The script mounts local public demo input into `/input`, writes predictions under `tmp_submission_test/output`, and logs under `tmp_submission_test/logs`. If `SUBMISSION_WRITE_TRACES=1`, per-task traces are written under `tmp_submission_test/logs/traces/task_<id>/trace.json`.
 
 Each task runs in a child process. If a task exceeds `SUBMISSION_TASK_TIMEOUT_SECONDS`, the process is stopped and an empty `prediction.csv` is written for that task so the remaining tasks can continue.
 

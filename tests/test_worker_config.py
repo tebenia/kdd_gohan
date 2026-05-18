@@ -12,6 +12,7 @@ from data_agent_baseline.submission import (
     SubmissionConfig,
     load_submission_config,
     task_worker_count,
+    write_trace,
 )
 
 
@@ -69,6 +70,7 @@ run:
 
         self.assertEqual(config.max_workers, 4)
         self.assertEqual(config.difficulty_max_workers, {"hard": 1})
+        self.assertFalse(config.write_traces)
 
     def test_submission_config_env_overrides_difficulty_workers(self) -> None:
         with patch.dict(
@@ -79,6 +81,7 @@ run:
                 "SUBMISSION_EASY_MAX_WORKERS": "5",
                 "SUBMISSION_MEDIUM_MAX_WORKERS": "4",
                 "SUBMISSION_HARD_MAX_WORKERS": "2",
+                "SUBMISSION_WRITE_TRACES": "true",
             },
             clear=True,
         ):
@@ -89,6 +92,7 @@ run:
             config.difficulty_max_workers,
             {"easy": 5, "medium": 4, "hard": 2},
         )
+        self.assertTrue(config.write_traces)
 
     def test_submission_task_worker_count_uses_task_difficulty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -108,10 +112,34 @@ run:
                 max_workers=4,
                 difficulty_max_workers={"hard": 1},
                 task_timeout_seconds=1,
+                write_traces=False,
             )
 
             self.assertEqual(task_worker_count(easy_dir, config), 4)
             self.assertEqual(task_worker_count(hard_dir, config), 1)
+
+    def test_submission_trace_writer_uses_logs_trace_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            trace_path = write_trace(
+                root / "logs",
+                "task_11",
+                {
+                    "task_id": "task_11",
+                    "answer": None,
+                    "steps": [],
+                    "failure_reason": "debug",
+                    "succeeded": False,
+                },
+            )
+
+            payload = json.loads(trace_path.read_text())
+
+        self.assertEqual(trace_path.name, "trace.json")
+        self.assertEqual(trace_path.parent.name, "task_11")
+        self.assertEqual(trace_path.parent.parent.name, "traces")
+        self.assertEqual(payload["task_id"], "task_11")
+        self.assertEqual(payload["failure_reason"], "debug")
 
 
 if __name__ == "__main__":

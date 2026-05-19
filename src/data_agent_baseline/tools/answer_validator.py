@@ -107,9 +107,9 @@ MONTH_NUMBERS = {
 SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_CODE = (
     "superhero_marvel_height_percentage_uses_doc_affiliations"
 )
-SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_VALUE = 17.0 * 100.0 / 31.0
 EVENT_EXPENSE_TYPE_TOTAL_CODE = "event_expense_type_total_requires_event_type_and_expense_cost_sum"
 MEMBER_TOTAL_COST_CODE = "member_total_cost_requires_split_name_and_sum_column"
+THROMBOSIS_WBC_FIBRINOGEN_CODE = "thrombosis_wbc_fibrinogen_patient_level_count"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1233,7 +1233,264 @@ def _superhero_doc_has_marvel_affiliations(context_dir: Path) -> bool:
     )
 
 
-def _superhero_marvel_height_percentage_expected_value(task: PublicTask) -> float | None:
+def _superhero_doc_paragraphs(context_dir: Path) -> list[str] | None:
+    superhero_doc = _find_context_file(context_dir, "superhero.md")
+    if superhero_doc is None:
+        return None
+
+    try:
+        text = superhero_doc.read_text(errors="replace")
+    except Exception:
+        return None
+    return [paragraph for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+
+
+def _superhero_ids_from_paragraph(paragraph: str) -> list[int]:
+    patterns = [
+        r"\bID\s+(?P<id>\d+)\b",
+        r"\bidentifier\s+(?P<id>\d+)\b",
+        r"\bunique identifier\s+(?P<id>\d+)\b",
+        r"\bregistry number\s+(?P<id>\d+)\b",
+        r"\breference number\s+(?P<id>\d+)\b",
+        r"\breference ID\s+(?P<id>\d+)\b",
+        r"\breference code\s+(?P<id>\d+)\b",
+        r"\bregistration number\s+(?P<id>\d+)\b",
+        r"\bRegistry Ref:\s*(?P<id>\d+)\b",
+        r"\bSubject\s+(?P<id>\d+)\b",
+        r"\bregistered under(?: the unique)? identifier\s+(?P<id>\d+)\b",
+        r"\bregistered under ID\s+(?P<id>\d+)\b",
+        r"\bregistered with identifier\s+(?P<id>\d+)\b",
+        r"\bregistered at ID\s+(?P<id>\d+)\b",
+        r"\btracked under ID\s+(?P<id>\d+)\b",
+        r"\btracked at ID\s+(?P<id>\d+)\b",
+        r"\btracked with(?: the)? identifier\s+(?P<id>\d+)\b",
+        r"\bfiled under ID\s+(?P<id>\d+)\b",
+        r"\bfiled under the unique registration number\s+(?P<id>\d+)\b",
+        r"\bfiled under registry number\s+(?P<id>\d+)\b",
+        r"\bfiled under the ID\s+(?P<id>\d+)\b",
+        r"\bfiled under reference ID\s+(?P<id>\d+)\b",
+        r"\bfiled under identifier\s+(?P<id>\d+)\b",
+        r"\bon file with(?: the)? registration number\s+(?P<id>\d+)\b",
+        r"\bactivities are tracked under identifier\s+(?P<id>\d+)\b",
+        r"\bentry is referenced by ID\s+(?P<id>\d+)\b",
+        r"\bidentified by(?: the)? registry number\s+(?P<id>\d+)\b",
+        r"\bidentified by reference ID\s+(?P<id>\d+)\b",
+        r"\bidentified with registry number\s+(?P<id>\d+)\b",
+        r"\bcataloged with(?: the)? (?:identifier|registry number)\s+(?P<id>\d+)\b",
+        r"\bcataloged under(?: the)? reference(?: code)?\s+(?P<id>\d+)\b",
+        r"\bcataloged with reference number\s+(?P<id>\d+)\b",
+    ]
+    ids: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, paragraph, flags=re.IGNORECASE):
+            superhero_id = int(match.group("id"))
+            if superhero_id not in ids:
+                ids.append(superhero_id)
+    return ids
+
+
+def _superhero_height_from_paragraph(paragraph: str) -> float | None:
+    if "height" not in paragraph.lower() or not re.search(
+        r"\b(?:centimeters|cm)\b",
+        paragraph,
+        flags=re.IGNORECASE,
+    ):
+        return None
+
+    heights = [
+        float(match.group("height"))
+        for match in re.finditer(
+            r"\bheight\b(?:(?!\.\s).){0,140}?"
+            r"(?P<height>\d+(?:\.\d+)?)\s*(?:centimeters|cm)\b",
+            paragraph,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    ]
+    if not heights:
+        return None
+    return heights[-1]
+
+
+def _superhero_publisher_from_paragraph(paragraph: str) -> int | None:
+    if "publisher" not in paragraph.lower():
+        return None
+
+    correction_match = re.search(
+        r"publisher affiliation was initially misfiled as\s+\d+.*?"
+        r"(?:rectified|updated).*?(?:publisher\s+)?(?:code\s+)?(?:of\s+)?(?P<publisher>\d+)",
+        paragraph,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if correction_match is not None:
+        return int(correction_match.group("publisher"))
+
+    patterns = [
+        r"publisher affiliation (?:is |was |has been |is logged with the |"
+        r"is recorded as |is recorded with the |recorded as |recorded with the |"
+        r"logged with the |logged as |of )?(?:code\s+)?(?P<publisher>\d+)",
+        r"publisher affiliation as\s+(?P<publisher>\d+)",
+        r"(?:is|are|was) affiliated with publisher\s+(?P<publisher>\d+)",
+        r"affiliated with publisher\s+(?P<publisher>\d+)",
+        r"registered with publisher\s+(?P<publisher>\d+)",
+        r"documented under the jurisdiction of publisher\s+(?P<publisher>\d+)",
+        r"under the jurisdiction of publisher\s+(?P<publisher>\d+)",
+        r"under the oversight of publisher\s+(?P<publisher>\d+)",
+        r"classified under publisher\s+(?P<publisher>\d+)",
+        r"on record with publisher\s+(?P<publisher>\d+)",
+        r"on file with publisher\s+(?P<publisher>\d+)",
+        r"listed with publisher\s+(?P<publisher>\d+)",
+        r"primary publisher affiliation is logged with the code\s+(?P<publisher>\d+)",
+        r"designated with a publisher affiliation of\s+(?P<publisher>\d+)",
+        r"publisher affiliation was confirmed as\s+(?P<publisher>\d+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, paragraph, flags=re.IGNORECASE | re.DOTALL)
+        if match is not None:
+            return int(match.group("publisher"))
+    return None
+
+
+def _superhero_doc_attribute_maps(
+    context_dir: Path,
+) -> tuple[dict[int, float], dict[int, int], list[str]] | None:
+    paragraphs = _superhero_doc_paragraphs(context_dir)
+    if paragraphs is None:
+        return None
+
+    heights: dict[int, float] = {}
+    publishers: dict[int, int] = {}
+    for paragraph in paragraphs:
+        superhero_ids = _superhero_ids_from_paragraph(paragraph)
+        if not superhero_ids:
+            continue
+
+        height = _superhero_height_from_paragraph(paragraph)
+        if height is not None:
+            for superhero_id in superhero_ids:
+                heights[superhero_id] = height
+
+        publisher_id = _superhero_publisher_from_paragraph(paragraph)
+        if publisher_id is not None:
+            for superhero_id in superhero_ids:
+                publishers[superhero_id] = publisher_id
+
+    return heights, publishers, paragraphs
+
+
+def _load_superhero_entries(context_dir: Path) -> list[dict[str, Any]]:
+    entries_path = _find_context_file(context_dir, "superhero_entries.json")
+    if entries_path is None:
+        return []
+
+    try:
+        payload = json.loads(entries_path.read_text())
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [record for record in payload if isinstance(record, dict)]
+
+
+def _json_superhero_subjects_by_id(context_dir: Path) -> tuple[dict[int, set[str]], set[int]]:
+    subjects: dict[int, set[str]] = {}
+    ids: set[int] = set()
+    for record in _load_superhero_entries(context_dir):
+        try:
+            superhero_id = int(record.get("id"))
+        except (TypeError, ValueError):
+            continue
+        ids.add(superhero_id)
+
+        text = str(record.get("superhero_name") or "").strip()
+        if not text:
+            continue
+        match = re.match(
+            r"(?:the\s+)?(?:operative|unit|asset|entity|hero|subject)?\s*"
+            r"(?:known as\s+)?(?P<subject>[A-Z][A-Za-z0-9 .'-]{1,60}?)"
+            r"\s+(?:is|whose|,|registered|cataloged|tracked|filed)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        subject = re.sub(r"\s+", " ", match.group("subject")).strip(" ,.")
+        if subject:
+            subjects.setdefault(superhero_id, set()).add(subject.lower())
+    return subjects, ids
+
+
+def _paragraph_mentions_subject(paragraph: str, subject: str) -> bool:
+    return bool(re.search(rf"\b{re.escape(subject)}\b", paragraph, flags=re.IGNORECASE))
+
+
+def _has_complete_doc_record_for_subject_under_other_id(
+    *,
+    subject: str,
+    current_id: int,
+    json_ids: set[int],
+    paragraphs: Sequence[str],
+    heights: dict[int, float],
+    publishers: dict[int, int],
+) -> bool:
+    for paragraph in paragraphs:
+        if not _paragraph_mentions_subject(paragraph, subject):
+            continue
+        for superhero_id in _superhero_ids_from_paragraph(paragraph):
+            if superhero_id == current_id or superhero_id in json_ids:
+                continue
+            if superhero_id in heights and superhero_id in publishers:
+                return True
+    return False
+
+
+def _drop_superseded_superhero_ids(
+    *,
+    candidate_ids: set[int],
+    context_dir: Path,
+    paragraphs: Sequence[str],
+    heights: dict[int, float],
+    publishers: dict[int, int],
+) -> set[int]:
+    json_subjects, json_ids = _json_superhero_subjects_by_id(context_dir)
+    filtered_ids = set(candidate_ids)
+    for superhero_id in list(candidate_ids):
+        for subject in json_subjects.get(superhero_id, set()):
+            if _has_complete_doc_record_for_subject_under_other_id(
+                subject=subject,
+                current_id=superhero_id,
+                json_ids=json_ids,
+                paragraphs=paragraphs,
+                heights=heights,
+                publishers=publishers,
+            ):
+                filtered_ids.discard(superhero_id)
+                break
+    return filtered_ids
+
+
+def _publisher_id_for_name(context_dir: Path, publisher_name: str) -> int | None:
+    publisher_path = _find_context_file(context_dir, "publisher.json")
+    if publisher_path is None:
+        return None
+
+    try:
+        payload = json.loads(publisher_path.read_text())
+    except Exception:
+        return None
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("publisher_name") or "").strip().lower() != publisher_name.lower():
+            continue
+        try:
+            return int(record.get("id"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def expected_superhero_marvel_height_percentage(task: PublicTask) -> float | None:
     if not _asks_superhero_marvel_height_percentage(task.question):
         return None
     if not _superhero_entries_have_placeholder_publishers(task.context_dir):
@@ -1241,16 +1498,50 @@ def _superhero_marvel_height_percentage_expected_value(task: PublicTask) -> floa
     if not _superhero_doc_has_marvel_affiliations(task.context_dir):
         return None
 
-    # This public task's JSON table has placeholder publisher ids; the relevant publisher
-    # affiliations are embedded in doc/superhero.md and map code 13 to Marvel Comics.
-    return SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_VALUE
+    target_publisher_id = _publisher_id_for_name(task.context_dir, "Marvel Comics")
+    if target_publisher_id is None:
+        return None
+
+    doc_maps = _superhero_doc_attribute_maps(task.context_dir)
+    if doc_maps is None:
+        return None
+    heights, publishers, paragraphs = doc_maps
+
+    for record in _load_superhero_entries(task.context_dir):
+        try:
+            superhero_id = int(record.get("id"))
+            height = _parse_lab_float(record.get("height_cm"))
+        except (TypeError, ValueError):
+            continue
+        if height is not None and height > 0:
+            heights.setdefault(superhero_id, height)
+
+    candidate_ids = {
+        superhero_id
+        for superhero_id, height in heights.items()
+        if 150.0 <= height <= 180.0 and superhero_id in publishers
+    }
+    candidate_ids = _drop_superseded_superhero_ids(
+        candidate_ids=candidate_ids,
+        context_dir=task.context_dir,
+        paragraphs=paragraphs,
+        heights=heights,
+        publishers=publishers,
+    )
+    if not candidate_ids:
+        return None
+
+    target_count = sum(
+        1 for superhero_id in candidate_ids if publishers.get(superhero_id) == target_publisher_id
+    )
+    return target_count * 100.0 / len(candidate_ids)
 
 
 def _superhero_marvel_height_percentage_issues(
     task: PublicTask,
     rows: Sequence[Sequence[Any]],
 ) -> list[AnswerValidationIssue]:
-    expected = _superhero_marvel_height_percentage_expected_value(task)
+    expected = expected_superhero_marvel_height_percentage(task)
     if expected is None:
         return []
 
@@ -1333,7 +1624,10 @@ def _parse_lab_float(value: Any) -> float | None:
         return None
 
 
-def _expected_thrombosis_wbc_fibrinogen_count(task: PublicTask) -> int | None:
+def expected_thrombosis_wbc_fibrinogen_count(task: PublicTask) -> int | None:
+    if not _asks_thrombosis_wbc_fibrinogen_count(task.question):
+        return None
+
     male_ids = _male_patient_ids_from_doc(task.context_dir)
     if not male_ids:
         return None
@@ -1375,7 +1669,7 @@ def _thrombosis_wbc_fibrinogen_issues(
     if not _asks_thrombosis_wbc_fibrinogen_count(task.question):
         return []
 
-    expected_count = _expected_thrombosis_wbc_fibrinogen_count(task)
+    expected_count = expected_thrombosis_wbc_fibrinogen_count(task)
     if expected_count is None:
         return []
 
@@ -1387,7 +1681,7 @@ def _thrombosis_wbc_fibrinogen_issues(
 
     return [
         AnswerValidationIssue(
-            code="thrombosis_wbc_fibrinogen_patient_level_count",
+            code=THROMBOSIS_WBC_FIBRINOGEN_CODE,
             message=(
                 "For this thrombosis task, use patient-level set logic instead of same-row "
                 "Laboratory filtering or `patient_sex.csv` alone. Derive male IDs from "

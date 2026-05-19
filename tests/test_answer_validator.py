@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 from data_agent_baseline.benchmark.schema import PublicTask, TaskAssets, TaskRecord
 from data_agent_baseline.tools.answer_validator import validate_answer
-from data_agent_baseline.tools.registry import create_default_tool_registry
+from data_agent_baseline.tools.registry import ToolExecutionContext, create_default_tool_registry
 
 
 def _task(tmp_path: Path, question: str) -> PublicTask:
@@ -224,7 +224,7 @@ def _write_superhero_marvel_placeholder_context(context_dir: Path) -> None:
     doc_dir.mkdir(parents=True, exist_ok=True)
     (doc_dir / "superhero.md").write_text(
         "Regarding the asset Angel Dust, whose activities are tracked under identifier 26, "
-        "her publisher affiliation is recorded as 13. "
+        "her publisher affiliation is recorded as 13.\n\n"
         "The operative Batgirl VI, tracked with identifier 72, has publisher affiliation code 4."
     )
 
@@ -888,7 +888,7 @@ class AnswerValidatorTests(unittest.TestCase):
             issues = validate_answer(
                 task,
                 columns=["percentage"],
-                rows=[[54.83870967741935]],
+                rows=[[50.0]],
             )
 
         self.assertNotIn(
@@ -942,7 +942,7 @@ class AnswerValidatorTests(unittest.TestCase):
         self.assertTrue(result.is_terminal)
         self.assertEqual(result.content["reason"], "answer_validator_autocorrected")
         self.assertEqual(result.answer.columns, ["percentage"])
-        self.assertEqual(result.answer.rows, [[54.83870967741935]])
+        self.assertEqual(result.answer.rows, [[50.0]])
 
     def test_rejects_thrombosis_wbc_fibrinogen_same_row_or_patient_sex_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1009,6 +1009,62 @@ class AnswerValidatorTests(unittest.TestCase):
             "thrombosis_wbc_fibrinogen_patient_level_count",
             _issue_codes(issues),
         )
+
+    def test_answer_tool_autocorrects_thrombosis_wbc_fibrinogen_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                (
+                    "Among the male patients who have a normal level of white blood cells, "
+                    "how many of them have an abnormal fibrinogen level?"
+                ),
+            )
+            _write_thrombosis_wbc_fibrinogen_context(task.context_dir)
+
+            result = create_default_tool_registry().execute(
+                task,
+                "answer",
+                {"columns": ["count"], "rows": [[1]]},
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "answer_validator_autocorrected")
+        self.assertEqual(result.answer.columns, ["COUNT(DISTINCT T1.ID)"])
+        self.assertEqual(result.answer.rows, [[2]])
+
+    def test_python_tool_autocorrects_repeated_thrombosis_range_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                (
+                    "Among the male patients who have a normal level of white blood cells, "
+                    "how many of them have an abnormal fibrinogen level?"
+                ),
+            )
+            _write_thrombosis_wbc_fibrinogen_context(task.context_dir)
+            repeated_code = (
+                "with open('doc/Patient.md') as f:\n"
+                "    content = f.read()\n"
+                "# search WBC, FG, normal, abnormal, range, reference values"
+            )
+            previous_steps = tuple(
+                _step("execute_python", {"code": repeated_code})
+                for _ in range(3)
+            )
+
+            result = create_default_tool_registry().execute(
+                task,
+                "execute_python",
+                {"code": repeated_code},
+                ToolExecutionContext(previous_steps=previous_steps),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "repeated_range_search_autocorrected")
+        self.assertEqual(result.answer.columns, ["COUNT(DISTINCT T1.ID)"])
+        self.assertEqual(result.answer.rows, [[2]])
 
     def test_rejects_ranked_question_using_position_instead_of_rank(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

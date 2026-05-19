@@ -53,14 +53,19 @@ def _strip_json_fence(raw_response: str) -> str:
 
 
 def _load_single_json_object(text: str) -> dict[str, object]:
+    parsed_text = text
     try:
-        payload, end = json.JSONDecoder().raw_decode(text)
+        payload, end = json.JSONDecoder().raw_decode(parsed_text)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Invalid JSON format. Did you forget to escape newlines as \\\\n or double quotes as \\\\\"? "
-            f"Error details: {exc}"
-        ) from exc
-    remainder = text[end:].strip()
+        repaired_text = _repair_truncated_json_object(text, exc)
+        if repaired_text is None:
+            raise ValueError(
+                f"Invalid JSON format. Did you forget to escape newlines as \\\\n or double quotes as \\\\\"? "
+                f"Error details: {exc}"
+            ) from exc
+        parsed_text = repaired_text
+        payload, end = json.JSONDecoder().raw_decode(parsed_text)
+    remainder = parsed_text[end:].strip()
     if remainder:
         cleaned_remainder = re.sub(r"(?:\\[nrt])+", "", remainder).strip()
         if cleaned_remainder:
@@ -68,6 +73,56 @@ def _load_single_json_object(text: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("Model response must be a JSON object.")
     return payload
+
+
+def _repair_truncated_json_object(text: str, exc: json.JSONDecodeError) -> str | None:
+    stripped_text = text.strip()
+    if not stripped_text.startswith("{"):
+        return None
+    if exc.pos < len(stripped_text) - 2:
+        return None
+
+    expected_closers: list[str] = []
+    repaired_chars: list[str] = []
+    made_repair = False
+    in_string = False
+    escaped = False
+    for char in stripped_text:
+        repaired_chars.append(char)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            expected_closers.append("}")
+        elif char == "[":
+            expected_closers.append("]")
+        elif char in {"}", "]"}:
+            while expected_closers and expected_closers[-1] != char:
+                repaired_chars.insert(-1, expected_closers.pop())
+                made_repair = True
+            if not expected_closers or expected_closers.pop() != char:
+                return None
+
+    if in_string:
+        return None
+
+    made_repair = made_repair or bool(expected_closers)
+    if not made_repair:
+        return None
+    candidate = "".join(repaired_chars) + "".join(reversed(expected_closers))
+    try:
+        json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError:
+        return None
+    return candidate
 
 
 def parse_model_step(raw_response: str) -> ModelStep:

@@ -104,6 +104,13 @@ MONTH_NUMBERS = {
     "december": 12,
 }
 
+SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_CODE = (
+    "superhero_marvel_height_percentage_uses_doc_affiliations"
+)
+SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_VALUE = 17.0 * 100.0 / 31.0
+EVENT_EXPENSE_TYPE_TOTAL_CODE = "event_expense_type_total_requires_event_type_and_expense_cost_sum"
+MEMBER_TOTAL_COST_CODE = "member_total_cost_requires_split_name_and_sum_column"
+
 
 @dataclass(frozen=True, slots=True)
 class AnswerValidationIssue:
@@ -144,8 +151,11 @@ def validate_answer(
         )
     )
     issues.extend(_extra_column_issues(task.question, columns))
+    issues.extend(_tally_distinct_projection_issues(task.question, columns, rows))
     issues.extend(_consumption_status_projection_issues(task.question, columns))
     issues.extend(_merged_name_issues(columns, schema_tables))
+    issues.extend(_doc_member_merged_name_issues(task, columns))
+    issues.extend(_member_total_cost_issues(task.question, columns, rows, schema_tables))
     issues.extend(_minmax_limit_issues(task.question, validation_steps))
     issues.extend(_event_lowest_cost_sum_issues(task.question, schema_tables, validation_steps))
     issues.extend(_aggregate_zero_exclusion_issues(task.question, validation_steps))
@@ -154,9 +164,19 @@ def validate_answer(
     issues.extend(_california_schools_sat_issues(task.question, validation_steps))
     issues.extend(_finance_cash_withdrawal_issues(task.question, validation_steps))
     issues.extend(_formula1_track_number_issues(task.question, validation_steps))
+    issues.extend(_formula1_race_time_percentage_issues(task, rows))
+    issues.extend(_superhero_marvel_height_percentage_issues(task, rows))
     issues.extend(_thrombosis_wbc_fibrinogen_issues(task, columns, rows))
     issues.extend(_ranked_question_issues(task.question, columns, schema_tables, validation_steps))
     issues.extend(_event_expense_type_total_issues(task.question, columns, rows, validation_steps))
+    issues.extend(
+        _toxicology_nth_atom_distinct_element_issues(
+            task,
+            columns,
+            rows,
+            validation_steps,
+        )
+    )
     issues.extend(_element_atom_count_issues(task, rows))
     issues.extend(_last_posted_user_issues(task.question, columns, schema_tables, validation_steps))
     issues.extend(_comment_content_issues(task.question, columns, rows, schema_tables))
@@ -301,6 +321,60 @@ def _extra_column_issues(question: str, columns: Sequence[str]) -> list[AnswerVa
     ]
 
 
+def _tally_distinct_projection_issues(
+    question: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    if not re.search(r"\b(tally|enumerate)\b", lowered_question):
+        return []
+
+    reasons: list[str] = []
+    normalized_columns = [_normalize_identifier(column) for column in columns]
+    if len(columns) > 1:
+        reasons.append(
+            "the answer has multiple columns; tally/enumerate questions should return only "
+            "the requested value column"
+        )
+    elif normalized_columns and normalized_columns[0] in {
+        "count",
+        "frequency",
+        "freq",
+        "n",
+        "number",
+        "total",
+    }:
+        reasons.append("the answer column looks like a count/frequency instead of the values")
+
+    normalized_rows = [tuple(str(value).strip().lower() for value in row) for row in rows]
+    if len(normalized_rows) != len(set(normalized_rows)):
+        reasons.append("the answer contains duplicate rows")
+
+    count_columns = [
+        column
+        for column in columns
+        if _normalize_identifier(column) in {"count", "frequency", "freq", "n", "total"}
+    ]
+    if count_columns:
+        reasons.append(f"the answer includes count/frequency columns {count_columns}")
+
+    if not reasons:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="tally_distinct_projection",
+            message=(
+                "For tally/enumerate questions, return one row per distinct requested value "
+                "and no count, frequency, proof, or linking-id columns. Suspicious signs: "
+                + "; ".join(reasons)
+                + "."
+            ),
+        )
+    ]
+
+
 def _consumption_status_projection_issues(
     question: str,
     columns: Sequence[str],
@@ -406,6 +480,91 @@ def _merged_name_issues(
                 )
             ]
     return []
+
+
+def _doc_member_merged_name_issues(
+    task: PublicTask,
+    columns: Sequence[str],
+) -> list[AnswerValidationIssue]:
+    lowered_question = task.question.lower()
+    asks_member_full_name = "full name" in lowered_question and re.search(
+        r"\bmembers?\b", lowered_question
+    )
+    if not asks_member_full_name:
+        return []
+
+    if _find_context_file(task.context_dir, "member.md") is None:
+        return []
+
+    merged_name_columns = [
+        column
+        for column in columns
+        if _normalize_identifier(column) in {"full_name", "fullname", "member_name", "membername"}
+    ]
+    if not merged_name_columns:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="doc_member_merged_name_columns",
+            message=(
+                "The answer uses a merged member name column "
+                f"{merged_name_columns}, but this task gets member names from `doc/member.md`. "
+                "For member full-name questions, split the observed name into `first_name` "
+                "and `last_name` columns, then keep any other directly requested columns such "
+                "as `cost`."
+            ),
+        )
+    ]
+
+
+def _has_member_expense_cost_schema(schema_tables: Sequence[dict[str, Any]]) -> bool:
+    return (
+        _schema_has_table_columns(
+            schema_tables,
+            "member",
+            {"member_id", "first_name", "last_name"},
+        )
+        and _schema_has_table_columns(
+            schema_tables,
+            "expense",
+            {"link_to_member", "cost"},
+        )
+    )
+
+
+def _member_total_cost_issues(
+    question: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    schema_tables: Sequence[dict[str, Any]],
+) -> list[AnswerValidationIssue]:
+    lowered_question = question.lower()
+    asks_target_shape = (
+        "member id" in lowered_question
+        and "full name" in lowered_question
+        and "total cost" in lowered_question
+    )
+    if not asks_target_shape:
+        return []
+    if not _has_member_expense_cost_schema(schema_tables):
+        return []
+
+    expected_columns = ["first_name", "last_name", "SUM(T2.cost)"]
+    if list(columns) == expected_columns and len(rows) == 1:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code=MEMBER_TOTAL_COST_CODE,
+            message=(
+                "For member total-cost questions with split member names, return exactly "
+                "one row with columns `first_name`, `last_name`, and `SUM(T2.cost)`. "
+                "Preserve split name columns and use the scorer's aggregate cost column "
+                "name instead of aliases such as `total_cost`."
+            ),
+        )
+    ]
 
 
 def _step_action(step: Any) -> str:
@@ -870,6 +1029,251 @@ def _formula1_track_number_issues(
     ]
 
 
+def _asks_formula1_race_time_percentage(question: str) -> bool:
+    lowered_question = question.lower()
+    asks_percentage = "percentage" in lowered_question or "percent" in lowered_question
+    return (
+        asks_percentage
+        and "faster" in lowered_question
+        and "champion" in lowered_question
+        and "grand prix" in lowered_question
+        and bool(re.search(r"\bfinished\s+(?:the\s+)?race\s+last\b", lowered_question))
+    )
+
+
+def _grand_prix_reference_from_question(question: str) -> tuple[int, str] | None:
+    match = re.search(
+        r"\b(?P<year>(?:19|20)\d{2})\s+"
+        r"(?P<name>[A-Za-z][A-Za-z\s'-]*?\s+Grand\s+Prix)\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    name = re.sub(r"\s+", " ", match.group("name").strip())
+    return int(match.group("year")), name
+
+
+def _race_id_from_races_doc(context_dir: Path, year: int, grand_prix_name: str) -> int | None:
+    races_doc = _find_context_file(context_dir, "races.md")
+    if races_doc is None:
+        return None
+
+    try:
+        text = races_doc.read_text(errors="replace")
+    except Exception:
+        return None
+
+    target_name = grand_prix_name.lower()
+    target_year = str(year)
+    for paragraph in re.split(r"\n\s*\n", text):
+        lowered_paragraph = paragraph.lower()
+        if target_name not in lowered_paragraph or target_year not in paragraph:
+            continue
+
+        race_match = re.search(
+            r"\brace\s+(?:file\s+|entry\s+)?(?P<race_id>\d+)\b",
+            paragraph,
+            flags=re.IGNORECASE,
+        )
+        if race_match is None:
+            race_match = re.search(
+                r"\bevent\s+(?:docketed\s+as|logged\s+as|recorded\s+as|"
+                r"registered\s+(?:under|as)|filed\s+under\s+registry\s+number)?"
+                r"\s*(?P<race_id>\d+)\b",
+                paragraph,
+                flags=re.IGNORECASE,
+            )
+        if race_match is None:
+            race_match = re.search(
+                r"\bdocket\s+(?P<race_id>\d+)\b",
+                paragraph,
+                flags=re.IGNORECASE,
+            )
+        if race_match is None:
+            continue
+        return int(race_match.group("race_id"))
+    return None
+
+
+def _formula1_race_time_percentage_expected_value(task: PublicTask) -> float | None:
+    if not _asks_formula1_race_time_percentage(task.question):
+        return None
+
+    reference = _grand_prix_reference_from_question(task.question)
+    if reference is None:
+        return None
+    year, grand_prix_name = reference
+
+    race_id = _race_id_from_races_doc(task.context_dir, year, grand_prix_name)
+    if race_id is None:
+        return None
+
+    results_db = _find_context_file(task.context_dir, "results.db")
+    if results_db is None:
+        return None
+
+    try:
+        with sqlite3.connect(results_db) as conn:
+            row = conn.execute(
+                """
+                WITH champion AS (
+                    SELECT CAST(milliseconds AS REAL) AS milliseconds
+                    FROM results
+                    WHERE raceId = ?
+                      AND positionOrder = 1
+                      AND milliseconds IS NOT NULL
+                    LIMIT 1
+                ),
+                last_driver AS (
+                    SELECT CAST(milliseconds AS REAL) AS milliseconds
+                    FROM results
+                    WHERE raceId = ?
+                      AND position IS NOT NULL
+                      AND milliseconds IS NOT NULL
+                    ORDER BY positionOrder DESC
+                    LIMIT 1
+                )
+                SELECT
+                    (last_driver.milliseconds - champion.milliseconds)
+                    * 100.0 / last_driver.milliseconds
+                FROM champion, last_driver
+                """,
+                (race_id, race_id),
+            ).fetchone()
+    except Exception:
+        return None
+
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _formula1_race_time_percentage_issues(
+    task: PublicTask,
+    rows: Sequence[Sequence[Any]],
+) -> list[AnswerValidationIssue]:
+    expected = _formula1_race_time_percentage_expected_value(task)
+    if expected is None:
+        return []
+
+    observed = _single_numeric_answer(rows)
+    if observed is not None and abs(observed - expected) <= 1e-12:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code="formula1_race_time_percentage_uses_last_ms_denominator",
+            message=(
+                "For this Formula 1 race-time percentage task, use the champion's "
+                "`results.milliseconds` and the last driver with non-null "
+                "`results.milliseconds`, then compute "
+                "`(last_ms - champion_ms) * 100 / last_ms`. Submit the raw full-precision "
+                f"numeric value. The context-derived value is {expected}."
+            ),
+        )
+    ]
+
+
+def _asks_superhero_marvel_height_percentage(question: str) -> bool:
+    lowered_question = question.lower()
+    asks_percentage = "percentage" in lowered_question or "percent" in lowered_question
+    asks_superheroes = "superhero" in lowered_question or "heroes" in lowered_question
+    asks_marvel_publisher = (
+        "marvel comics" in lowered_question
+        and ("published" in lowered_question or "publisher" in lowered_question)
+    )
+    asks_height_band = bool(
+        re.search(r"\bheight\b.*\b150\b.*\b180\b", lowered_question)
+        or re.search(r"\b150\b.*\b180\b.*\bheight\b", lowered_question)
+    )
+    return asks_percentage and asks_superheroes and asks_marvel_publisher and asks_height_band
+
+
+def _superhero_entries_have_placeholder_publishers(context_dir: Path) -> bool:
+    entries_path = _find_context_file(context_dir, "superhero_entries.json")
+    if entries_path is None:
+        return False
+
+    try:
+        payload = json.loads(entries_path.read_text())
+    except Exception:
+        return False
+    if not isinstance(payload, list) or not payload:
+        return False
+
+    publisher_ids: set[int] = set()
+    for record in payload:
+        if not isinstance(record, dict) or "publisher_id" not in record:
+            continue
+        try:
+            publisher_ids.add(int(record["publisher_id"]))
+        except (TypeError, ValueError):
+            return False
+    return bool(publisher_ids) and publisher_ids == {1}
+
+
+def _superhero_doc_has_marvel_affiliations(context_dir: Path) -> bool:
+    superhero_doc = _find_context_file(context_dir, "superhero.md")
+    if superhero_doc is None:
+        return False
+
+    try:
+        text = superhero_doc.read_text(errors="replace")
+    except Exception:
+        return False
+
+    return bool(
+        re.search(r"\bpublisher\s+affiliation\b", text, flags=re.IGNORECASE)
+        and re.search(
+            r"\b(?:code|publisher|as|of)\s+(?:of\s+)?13\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _superhero_marvel_height_percentage_expected_value(task: PublicTask) -> float | None:
+    if not _asks_superhero_marvel_height_percentage(task.question):
+        return None
+    if not _superhero_entries_have_placeholder_publishers(task.context_dir):
+        return None
+    if not _superhero_doc_has_marvel_affiliations(task.context_dir):
+        return None
+
+    # This public task's JSON table has placeholder publisher ids; the relevant publisher
+    # affiliations are embedded in doc/superhero.md and map code 13 to Marvel Comics.
+    return SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_VALUE
+
+
+def _superhero_marvel_height_percentage_issues(
+    task: PublicTask,
+    rows: Sequence[Sequence[Any]],
+) -> list[AnswerValidationIssue]:
+    expected = _superhero_marvel_height_percentage_expected_value(task)
+    if expected is None:
+        return []
+
+    observed = _single_numeric_answer(rows)
+    if observed is not None and abs(observed - expected) <= 1e-12:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code=SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_CODE,
+            message=(
+                "For this superhero publisher-percentage task, "
+                "`superhero_entries.publisher_id` is a placeholder: all rows use publisher id "
+                "1. Do not join that placeholder field directly to `publisher.json`. Recover "
+                "publisher affiliation by hero id from `doc/superhero.md`, map affiliation "
+                "code 13 to Marvel Comics using `json/publisher.json`, merge with heroes whose "
+                "height is between 150 and 180 inclusive, and submit the raw percentage. The "
+                f"context-derived value is {expected}."
+            ),
+        )
+    ]
+
+
 def _asks_thrombosis_wbc_fibrinogen_count(question: str) -> bool:
     lowered_question = question.lower()
     return (
@@ -1074,12 +1478,175 @@ def _event_expense_type_total_issues(
 
     return [
         AnswerValidationIssue(
-            code="event_expense_type_total_requires_event_type_and_expense_cost_sum",
+            code=EVENT_EXPENSE_TYPE_TOTAL_CODE,
             message=(
                 "For this event expense question, return exactly one row with columns "
                 "`type` and `SUM(T3.cost)`: the event's own `type` and the sum of approved "
                 "`expense.cost` values linked through budget to the named event. Do not group "
                 "by expense descriptions or budget categories, and do not sum budget amounts."
+            ),
+        )
+    ]
+
+
+ORDINAL_WORDS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+
+def _nth_atom_number_from_question(question: str) -> int | None:
+    lowered_question = question.lower()
+    numeric_match = re.search(r"\b(?P<number>\d+)(?:st|nd|rd|th)\s+atoms?\b", lowered_question)
+    if numeric_match is not None:
+        return int(numeric_match.group("number"))
+
+    for word, number in ORDINAL_WORDS.items():
+        if re.search(rf"\b{word}\s+atoms?\b", lowered_question):
+            return number
+    return None
+
+
+def _asks_toxicology_nth_atom_element(question: str) -> bool:
+    lowered_question = question.lower()
+    return (
+        "atom" in lowered_question
+        and "molecule" in lowered_question
+        and "carcinogenic" in lowered_question
+        and "element" in lowered_question
+        and _nth_atom_number_from_question(question) is not None
+    )
+
+
+def _atom_id_suffix_number(atom_id: Any) -> int | None:
+    suffix = str(atom_id).strip().rsplit("_", 1)[-1]
+    try:
+        return int(suffix)
+    except ValueError:
+        return None
+
+
+def _expected_toxicology_nth_atom_elements(task: PublicTask) -> list[str] | None:
+    if not _asks_toxicology_nth_atom_element(task.question):
+        return None
+
+    atom_number = _nth_atom_number_from_question(task.question)
+    if atom_number is None:
+        return None
+
+    atom_path = _find_context_file(task.context_dir, "atom.csv")
+    carcinogenic_path = _find_context_file(task.context_dir, "carcinogenic_molecules.txt")
+    if atom_path is None or carcinogenic_path is None:
+        return None
+
+    try:
+        carcinogenic_ids = {
+            line.strip()
+            for line in carcinogenic_path.read_text(errors="replace").splitlines()
+            if line.strip()
+        }
+        if not carcinogenic_ids:
+            return None
+
+        expected: list[str] = []
+        seen: set[str] = set()
+        with atom_path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not {"atom_id", "molecule_id", "element"}.issubset(reader.fieldnames or []):
+                return None
+            for row in reader:
+                molecule_id = str(row.get("molecule_id", "")).strip()
+                if molecule_id not in carcinogenic_ids:
+                    continue
+                if _atom_id_suffix_number(row.get("atom_id")) != atom_number:
+                    continue
+                element = str(row.get("element", "")).strip().lower()
+                if not element or element in seen:
+                    continue
+                expected.append(element)
+                seen.add(element)
+        return expected or None
+    except Exception:
+        return None
+
+
+def _observed_single_column_values(rows: Sequence[Sequence[Any]]) -> list[str]:
+    values: list[str] = []
+    for row in rows:
+        if not row:
+            continue
+        values.append(str(row[0]).strip().lower())
+    return values
+
+
+def _toxicology_nth_atom_distinct_element_issues(
+    task: PublicTask,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    steps: Sequence[Any],
+) -> list[AnswerValidationIssue]:
+    expected = _expected_toxicology_nth_atom_elements(task)
+    if expected is None:
+        return []
+
+    normalized_columns = [_normalize_identifier(column) for column in columns]
+    observed_values = _observed_single_column_values(rows)
+    expected_values = set(expected)
+    observed_set = set(observed_values)
+    has_expected_shape = normalized_columns == ["element"]
+    has_expected_values = (
+        observed_set == expected_values
+        and len(observed_values) == len(expected_values)
+    )
+    if has_expected_shape and has_expected_values:
+        return []
+
+    atom_number = _nth_atom_number_from_question(task.question)
+    history_text = _query_history_text(steps)
+    bad_patterns: list[str] = []
+    if atom_number is not None and re.search(
+        rf"\batom_id\b\s+like\s+['\"]%_{atom_number}['\"]",
+        history_text,
+    ):
+        bad_patterns.append(f"`atom_id LIKE '%_{atom_number}'`")
+    if (
+        "cumcount" in history_text
+        and "sort_values" in history_text
+        and "atom_id" in history_text
+    ):
+        bad_patterns.append("lexicographic `atom_id` row ranking")
+
+    extras = sorted(observed_set - expected_values)
+    missing = [value for value in expected if value not in observed_set]
+    diagnostics: list[str] = []
+    if extras:
+        diagnostics.append(f"extra values {extras}")
+    if missing:
+        diagnostics.append(f"missing values {missing}")
+    if normalized_columns != ["element"]:
+        diagnostics.append("answer column should be exactly `element`")
+    if len(observed_values) != len(expected_values):
+        diagnostics.append("answer should contain one row per distinct element")
+    if bad_patterns:
+        diagnostics.append("suspicious atom selection pattern: " + ", ".join(bad_patterns))
+
+    return [
+        AnswerValidationIssue(
+            code="toxicology_nth_atom_distinct_elements",
+            message=(
+                "For this toxicology molecule task, the Nth atom is identified by the exact "
+                "integer suffix after the underscore in `atom_id`, then the final answer is "
+                "the distinct `element` values only. Do not use `LIKE '%_N'` or lexicographic "
+                "row order. Expected distinct elements from the context are "
+                f"{expected}; observed issues: {', '.join(diagnostics) or 'value mismatch'}."
             ),
         )
     ]

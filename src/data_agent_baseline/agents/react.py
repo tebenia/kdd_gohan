@@ -75,6 +75,120 @@ def _load_single_json_object(text: str) -> dict[str, object]:
     return payload
 
 
+def _find_json_key_value_start(text: str, key: str, *, start: int = 0) -> int | None:
+    key_match = re.search(rf'"{re.escape(key)}"\s*:', text[start:])
+    if key_match is None:
+        return None
+    value_start = start + key_match.end()
+    while value_start < len(text) and text[value_start].isspace():
+        value_start += 1
+    return value_start
+
+
+def _load_json_string_at(text: str, start: int) -> str | None:
+    try:
+        value, _end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _load_json_array_at(text: str, start: int) -> list[object] | None:
+    if start >= len(text) or text[start] != "[":
+        return None
+
+    try:
+        value, _end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, list):
+        return value
+
+    depth = 0
+    in_string = False
+    escaped = False
+    chars: list[str] = []
+    for char in text[start:]:
+        if not in_string and char == "}" and depth > 0:
+            candidate = "".join(chars) + ("]" * depth)
+            try:
+                repaired_value = json.loads(candidate)
+            except json.JSONDecodeError:
+                return None
+            return repaired_value if isinstance(repaired_value, list) else None
+
+        chars.append(char)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed_value = json.loads("".join(chars))
+                except json.JSONDecodeError:
+                    return None
+                return parsed_value if isinstance(parsed_value, list) else None
+        elif depth < 0:
+            return None
+
+    if depth <= 0:
+        return None
+    try:
+        repaired_value = json.loads("".join(chars) + ("]" * depth))
+    except json.JSONDecodeError:
+        return None
+    return repaired_value if isinstance(repaired_value, list) else None
+
+
+def _recover_malformed_answer_payload(text: str) -> dict[str, object] | None:
+    if re.search(r'"action"\s*:\s*"answer"\s*,', text) is None:
+        return None
+
+    action_input_start = _find_json_key_value_start(text, "action_input")
+    if action_input_start is None:
+        return None
+
+    columns_start = _find_json_key_value_start(text, "columns", start=action_input_start)
+    rows_start = _find_json_key_value_start(text, "rows", start=action_input_start)
+    if columns_start is None or rows_start is None:
+        return None
+
+    columns = _load_json_array_at(text, columns_start)
+    rows = _load_json_array_at(text, rows_start)
+    if (
+        columns is None
+        or rows is None
+        or not all(isinstance(column, str) for column in columns)
+        or not all(isinstance(row, list) for row in rows)
+    ):
+        return None
+
+    thought_start = _find_json_key_value_start(text, "thought")
+    thought = ""
+    if thought_start is not None:
+        thought = _load_json_string_at(text, thought_start) or ""
+
+    return {
+        "thought": thought,
+        "action": "answer",
+        "action_input": {
+            "columns": columns,
+            "rows": rows,
+        },
+    }
+
+
 def _repair_truncated_json_object(text: str, exc: json.JSONDecodeError) -> str | None:
     stripped_text = text.strip()
     if not stripped_text.startswith("{"):
@@ -127,7 +241,13 @@ def _repair_truncated_json_object(text: str, exc: json.JSONDecodeError) -> str |
 
 def parse_model_step(raw_response: str) -> ModelStep:
     normalized = _strip_json_fence(raw_response)
-    payload = _load_single_json_object(normalized)
+    try:
+        payload = _load_single_json_object(normalized)
+    except ValueError:
+        recovered_payload = _recover_malformed_answer_payload(normalized)
+        if recovered_payload is None:
+            raise
+        payload = recovered_payload
 
     thought = payload.get("thought", "")
     action = payload.get("action")

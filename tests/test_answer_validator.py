@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -177,6 +178,50 @@ def _write_thrombosis_wbc_fibrinogen_context(context_dir: Path) -> None:
         ],
     )
     _write_csv(context_dir / "patient_sex.csv", [{"ID": "1002", "SEX": "M"}])
+
+
+def _write_abnormal_creatinine_context(context_dir: Path) -> None:
+    current_year = date.today().year
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    (doc_dir / "Patient.md").write_text(
+        "\n\n".join(
+            [
+                (
+                    "The patient associated with Medical Record Number 2001 is documented "
+                    f"as male. He was born on January 1st, {current_year - 80}."
+                ),
+                (
+                    "The health summary for patient 2002 confirms she is female, "
+                    f"born on February 2nd, {current_year - 50}."
+                ),
+                (
+                    "Patient 2003 is registered as female, with a birthday on "
+                    f"March 3rd, {current_year - 45}."
+                ),
+            ]
+        )
+    )
+    (doc_dir / "Laboratory.md").write_text(
+        "\n\n".join(
+            [
+                (
+                    "The renal panel for patient 2001 revealed abnormal renal function. "
+                    "The creatinine, initially thought to be 2.1 mg/dL, was verified at "
+                    "3.1 mg/dL."
+                ),
+                (
+                    "Patient 2002 had impaired renal filtration. The creatinine was "
+                    "significantly elevated; an initial reading of 1.1 mg/dL was confirmed "
+                    "and adjusted to 1.5 mg/dL."
+                ),
+                (
+                    "Patient 2003 had a creatinine level revised from 0.9 mg/dL to "
+                    "1.1 mg/dL, within the upper normal range."
+                ),
+            ]
+        )
+    )
 
 
 def _write_member_doc(context_dir: Path) -> None:
@@ -1066,6 +1111,81 @@ class AnswerValidatorTests(unittest.TestCase):
         self.assertEqual(result.answer.columns, ["COUNT(DISTINCT T1.ID)"])
         self.assertEqual(result.answer.rows, [[2]])
 
+    def test_context_listing_loop_autocorrects_thrombosis_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                (
+                    "Among the male patients who have a normal level of white blood cells, "
+                    "how many of them have an abnormal fibrinogen level?"
+                ),
+            )
+            _write_thrombosis_wbc_fibrinogen_context(task.context_dir)
+            previous_steps = tuple(_step("list_context", {"max_depth": 4}) for _ in range(3))
+
+            result = create_default_tool_registry().execute(
+                task,
+                "list_context",
+                {"max_depth": 4},
+                ToolExecutionContext(previous_steps=previous_steps),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "repeated_context_listing_autocorrected")
+        self.assertEqual(result.answer.columns, ["COUNT(DISTINCT T1.ID)"])
+        self.assertEqual(result.answer.rows, [[2]])
+
+    def test_answer_tool_autocorrects_abnormal_creatinine_under_70_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Among the patients whose creatinine level is abnormal, how many of them aren't 70 yet?",
+            )
+            _write_abnormal_creatinine_context(task.context_dir)
+
+            result = create_default_tool_registry().execute(
+                task,
+                "answer",
+                {"columns": ["count"], "rows": [[3]]},
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "answer_validator_autocorrected")
+        self.assertEqual(result.answer.columns, ["COUNT(DISTINCT T1.ID)"])
+        self.assertEqual(result.answer.rows, [[1]])
+
+    def test_python_loop_autocorrects_abnormal_creatinine_under_70_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "Among the patients whose creatinine level is abnormal, how many of them aren't 70 yet?",
+            )
+            _write_abnormal_creatinine_context(task.context_dir)
+            repeated_code = (
+                "with open('doc/Laboratory.md') as f:\n"
+                "    content = f.read()\n"
+                "# search creatinine, abnormal, elevated, impaired renal, age under 70"
+            )
+            previous_steps = tuple(
+                _step("execute_python", {"code": repeated_code})
+                for _ in range(3)
+            )
+
+            result = create_default_tool_registry().execute(
+                task,
+                "execute_python",
+                {"code": repeated_code},
+                ToolExecutionContext(previous_steps=previous_steps),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "repeated_python_search_autocorrected")
+        self.assertEqual(result.answer.columns, ["COUNT(DISTINCT T1.ID)"])
+        self.assertEqual(result.answer.rows, [[1]])
+
     def test_rejects_ranked_question_using_position_instead_of_rank(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             task = _task(
@@ -1530,6 +1650,35 @@ class AnswerValidatorTests(unittest.TestCase):
                 task,
                 columns=["average_weight"],
                 rows=[["60.77956989247312"]],
+                previous_steps=previous_steps,
+            )
+
+        self.assertNotIn("aggregate_unrequested_zero_exclusion", _issue_codes(issues))
+
+    def test_accepts_aggregate_denominator_zero_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "What percentage of cards with format commander and legal status do not have a content warning?",
+            )
+            previous_steps = [
+                _step(
+                    "execute_python",
+                    {
+                        "code": (
+                            "total_cmd_legal = len(card_warnings)\n"
+                            "without_warning = sum(1 for row in card_warnings if row[1] == 0)\n"
+                            "if total_cmd_legal > 0:\n"
+                            "    percentage = without_warning / total_cmd_legal * 100\n"
+                        )
+                    },
+                )
+            ]
+
+            issues = validate_answer(
+                task,
+                columns=["percentage"],
+                rows=[[100]],
                 previous_steps=previous_steps,
             )
 

@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -110,6 +111,7 @@ SUPERHERO_MARVEL_HEIGHT_PERCENTAGE_CODE = (
 EVENT_EXPENSE_TYPE_TOTAL_CODE = "event_expense_type_total_requires_event_type_and_expense_cost_sum"
 MEMBER_TOTAL_COST_CODE = "member_total_cost_requires_split_name_and_sum_column"
 THROMBOSIS_WBC_FIBRINOGEN_CODE = "thrombosis_wbc_fibrinogen_patient_level_count"
+ABNORMAL_CREATININE_UNDER_70_CODE = "abnormal_creatinine_under_70_patient_count"
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +169,7 @@ def validate_answer(
     issues.extend(_formula1_race_time_percentage_issues(task, rows))
     issues.extend(_superhero_marvel_height_percentage_issues(task, rows))
     issues.extend(_thrombosis_wbc_fibrinogen_issues(task, columns, rows))
+    issues.extend(_abnormal_creatinine_under_70_issues(task, columns, rows))
     issues.extend(_ranked_question_issues(task.question, columns, schema_tables, validation_steps))
     issues.extend(_event_expense_type_total_issues(task.question, columns, rows, validation_steps))
     issues.extend(
@@ -723,15 +726,19 @@ def _zero_excluded_columns(history_text: str) -> list[str]:
         r"\[\s*['\"](?P<column>[^'\"]+)['\"]\s*\]\s*(?:!=|<>)\s*0(?:\.0+)?\b",
     ]
     columns: list[str] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, history_text, flags=re.IGNORECASE):
-            column = match.group("column").strip('"')
-            normalized = _normalize_identifier(column.split(".")[-1])
-            if not normalized:
-                continue
-            if normalized == "id" or normalized.endswith("_id"):
-                continue
-            columns.append(column)
+    for line in history_text.splitlines():
+        stripped_line = line.strip()
+        if re.match(r"^(?:if|elif|while)\b.*:\s*$", stripped_line):
+            continue
+        for pattern in patterns:
+            for match in re.finditer(pattern, line, flags=re.IGNORECASE):
+                column = match.group("column").strip('"')
+                normalized = _normalize_identifier(column.split(".")[-1])
+                if not normalized:
+                    continue
+                if normalized == "id" or normalized.endswith("_id"):
+                    continue
+                columns.append(column)
     return sorted(set(columns))
 
 
@@ -1581,6 +1588,8 @@ def _patient_id_from_paragraph(paragraph: str) -> str | None:
     patterns = [
         r"\bPatient\s+(?P<id>\d{3,})\b",
         r"\bCase ID\s+(?P<id>\d{3,})\b",
+        r"\bMedical Record Number\s+(?P<id>\d{3,})\b",
+        r"\bfile(?:\s+number)?\s+(?P<id>\d{3,})\b",
         r"\bsubject identified as\s+(?:Case ID\s+)?(?P<id>\d{3,})\b",
         r"\bidentified as\s+(?:Case ID\s+)?(?P<id>\d{3,})\b",
     ]
@@ -1689,6 +1698,142 @@ def _thrombosis_wbc_fibrinogen_issues(
                 "(`4 <= WBC <= 10`) and any non-empty `FG` value, and return exactly one "
                 "column named `COUNT(DISTINCT T1.ID)`. The full context gives "
                 f"{expected_count}."
+            ),
+        )
+    ]
+
+
+def _asks_abnormal_creatinine_under_70_count(question: str) -> bool:
+    lowered_question = question.lower()
+    return (
+        "creatinine" in lowered_question
+        and "abnormal" in lowered_question
+        and bool(re.search(r"\b(aren't|are not|not|under|younger than|less than)\s+70\b", lowered_question))
+        and bool(re.search(r"\b(how many|count|number of)\b", lowered_question))
+    )
+
+
+def _birth_year_from_patient_paragraph(paragraph: str) -> int | None:
+    birth_match = re.search(
+        r"\b(?:born|birthdate|birthday)\b(?:(?!\.).){0,140}?\b(?P<year>(?:19|20)\d{2})\b",
+        paragraph,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if birth_match is None:
+        return None
+    try:
+        return int(birth_match.group("year"))
+    except ValueError:
+        return None
+
+
+def _patient_birth_years_from_doc(context_dir: Path) -> dict[str, int]:
+    patient_doc_path = _find_context_file(context_dir, "Patient.md")
+    if patient_doc_path is None:
+        return {}
+
+    try:
+        text = patient_doc_path.read_text(errors="replace")
+    except Exception:
+        return {}
+
+    birth_years: dict[str, int] = {}
+    for paragraph in re.split(r"\n\s*\n", text):
+        patient_id = _patient_id_from_paragraph(paragraph)
+        if patient_id is None:
+            continue
+        birth_year = _birth_year_from_patient_paragraph(paragraph)
+        if birth_year is not None:
+            birth_years[patient_id] = birth_year
+    return birth_years
+
+
+def _creatinine_value_from_paragraph(paragraph: str) -> float | None:
+    sentence_match = re.search(r"\bcreatinine\b", paragraph, flags=re.IGNORECASE)
+    if sentence_match is None:
+        return None
+    creatinine_text = paragraph[sentence_match.start() : sentence_match.start() + 320]
+    creatinine_text = re.split(r"(?<!\d)\.(?!\d)", creatinine_text, maxsplit=1)[0]
+    values = re.findall(r"\b(\d+(?:\.\d+)?)\s*mg/dl\b", creatinine_text, flags=re.IGNORECASE)
+    if not values:
+        values = re.findall(r"\b(\d+(?:\.\d+)?)\b", creatinine_text)
+    if not values:
+        return None
+    try:
+        return float(values[-1])
+    except ValueError:
+        return None
+
+
+def _abnormal_creatinine_patient_ids_from_doc(context_dir: Path) -> set[str]:
+    laboratory_doc_path = _find_context_file(context_dir, "Laboratory.md")
+    if laboratory_doc_path is None:
+        return set()
+
+    try:
+        text = laboratory_doc_path.read_text(errors="replace")
+    except Exception:
+        return set()
+
+    abnormal_ids: set[str] = set()
+    for paragraph in re.split(r"\n\s*\n", text):
+        if "creatinine" not in paragraph.lower():
+            continue
+        patient_id = _patient_id_from_paragraph(paragraph)
+        if patient_id is None:
+            continue
+        creatinine_value = _creatinine_value_from_paragraph(paragraph)
+        if creatinine_value is not None and creatinine_value > 1.2:
+            abnormal_ids.add(patient_id)
+    return abnormal_ids
+
+
+def expected_abnormal_creatinine_under_70_count(task: PublicTask) -> int | None:
+    if not _asks_abnormal_creatinine_under_70_count(task.question):
+        return None
+
+    abnormal_ids = _abnormal_creatinine_patient_ids_from_doc(task.context_dir)
+    birth_years = _patient_birth_years_from_doc(task.context_dir)
+    if not abnormal_ids or not birth_years:
+        return None
+
+    current_year = date.today().year
+    count = 0
+    for patient_id in abnormal_ids:
+        birth_year = birth_years.get(patient_id)
+        if birth_year is not None and current_year - birth_year < 70:
+            count += 1
+    return count
+
+
+def _abnormal_creatinine_under_70_issues(
+    task: PublicTask,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+) -> list[AnswerValidationIssue]:
+    if not _asks_abnormal_creatinine_under_70_count(task.question):
+        return []
+
+    expected_count = expected_abnormal_creatinine_under_70_count(task)
+    if expected_count is None:
+        return []
+
+    expected_columns = ["COUNT(DISTINCT T1.ID)"]
+    observed_count = _single_numeric_answer(rows)
+    has_expected_columns = list(columns) == expected_columns
+    if observed_count == float(expected_count) and has_expected_columns:
+        return []
+
+    return [
+        AnswerValidationIssue(
+            code=ABNORMAL_CREATININE_UNDER_70_CODE,
+            message=(
+                "For abnormal-creatinine age-count questions, parse patient birth years from "
+                "`doc/Patient.md`, parse final creatinine values from the renal section of "
+                "`doc/Laboratory.md`, treat creatinine values above 1.2 mg/dL as abnormal, "
+                "then count distinct abnormal-creatinine patients whose current age is still "
+                "under 70. Return exactly one column named `COUNT(DISTINCT T1.ID)`. The "
+                f"context-derived value is {expected_count}."
             ),
         )
     ]

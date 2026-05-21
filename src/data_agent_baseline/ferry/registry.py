@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
+from data_agent_baseline.tools.answer_validator import validate_answer
+from data_agent_baseline.tools.duckdb import (
+    execute_context_duckdb_sql,
+    inspect_context_tables,
+)
 from data_agent_baseline.tools.filesystem import (
     list_context_tree,
     read_csv_preview,
@@ -72,6 +77,18 @@ def _execute_context_sql(task: PublicTask, action_input: dict[str, Any]) -> Tool
     return ToolExecutionResult(ok=True, content=execute_read_only_sql(path, sql, limit=limit))
 
 
+def _inspect_context_tables(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+    return ToolExecutionResult(ok=True, content=inspect_context_tables(task.context_dir))
+
+
+def _execute_context_duckdb(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
+    sql = str(action_input["sql"])
+    limit = int(action_input.get("limit", 200))
+    return ToolExecutionResult(
+        ok=True, content=execute_context_duckdb_sql(task.context_dir, sql, limit=limit)
+    )
+
+
 def _execute_python(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
     code = str(action_input["code"])
     content = execute_python_code(
@@ -124,10 +141,60 @@ class ToolRegistry:
             lines.append(f"  input_schema: {spec.input_schema}")
         return "\n".join(lines)
 
-    def execute(self, task: PublicTask, action: str, action_input: dict[str, Any]) -> ToolExecutionResult:
+    def execute(
+        self,
+        task: PublicTask,
+        action: str,
+        action_input: dict[str, Any],
+        previous_steps: Sequence[Any] = (),
+    ) -> ToolExecutionResult:
         if action not in self.handlers:
             raise KeyError(f"Unknown tool: {action}")
+        if action == "answer":
+            rejection = self._validate_answer(task, action_input, previous_steps)
+            if rejection is not None:
+                return rejection
         return self.handlers[action](task, action_input)
+
+    @staticmethod
+    def _validate_answer(
+        task: PublicTask,
+        action_input: dict[str, Any],
+        previous_steps: Sequence[Any],
+    ) -> ToolExecutionResult | None:
+        """Soft-reject a final answer with generic, schema-agnostic feedback.
+
+        Returns a rejection result to send back to the agent, or None to accept. The check
+        is capped: after a couple of prior `answer` attempts we stop nagging so a borderline
+        validator can never loop a task to timeout (important on the hidden B-board).
+        """
+        prior_answer_attempts = sum(
+            1 for step in previous_steps if "answer" in str(getattr(step, "action", "") or "")
+        )
+        if prior_answer_attempts >= 1:
+            return None
+
+        issues = validate_answer(
+            task.question,
+            action_input.get("columns"),
+            action_input.get("rows"),
+            previous_steps,
+        )
+        if not issues:
+            return None
+
+        return ToolExecutionResult(
+            ok=False,
+            content={
+                "status": "rejected",
+                "reason": "answer_validator",
+                "issues": issues,
+                "instruction": (
+                    "Revise the query or final projection using the feedback above, then call "
+                    "answer again with the corrected table."
+                ),
+            },
+        )
 
 
 def create_default_tool_registry() -> ToolRegistry:
@@ -149,6 +216,26 @@ def create_default_tool_registry() -> ToolRegistry:
             name="execute_context_sql",
             description="Run a read-only SQL query against a sqlite/db file inside context.",
             input_schema={"path": "relative/path/to/file.sqlite", "sql": "SELECT ...", "limit": 200},
+        ),
+        "inspect_context_tables": ToolSpec(
+            name="inspect_context_tables",
+            description=(
+                "List every CSV and JSON file in context as a queryable table, with its "
+                "table name, source path, columns, and row count. Call this before "
+                "execute_context_duckdb to learn the table/column names to query."
+            ),
+            input_schema={},
+        ),
+        "execute_context_duckdb": ToolSpec(
+            name="execute_context_duckdb",
+            description=(
+                "Run a read-only DuckDB SELECT/WITH query across ALL CSV and JSON files in "
+                "context at once (each file is a table named as shown by inspect_context_tables). "
+                "Preferred over execute_python for querying or joining .csv/.json data: it is "
+                "real SQL, handles cross-file joins, and avoids pandas/JSON-escaping issues. "
+                "Only one statement; SELECT or WITH only."
+            ),
+            input_schema={"sql": "SELECT ... FROM table_a JOIN table_b ...", "limit": 200},
         ),
         "execute_python": ToolSpec(
             name="execute_python",
@@ -190,6 +277,8 @@ def create_default_tool_registry() -> ToolRegistry:
     handlers = {
         "answer": _answer,
         "execute_context_sql": _execute_context_sql,
+        "inspect_context_tables": _inspect_context_tables,
+        "execute_context_duckdb": _execute_context_duckdb,
         "execute_python": _execute_python,
         "inspect_sqlite_schema": _inspect_sqlite_schema,
         "list_context": _list_context,

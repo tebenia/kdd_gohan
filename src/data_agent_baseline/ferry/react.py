@@ -396,7 +396,9 @@ class ReActAgent:
                 is_terminal = False
                 
                 def run_action(act: ModelAction):
-                    return act, self.tools.execute(task, act.action, act.action_input)
+                    return act, self.tools.execute(
+                        task, act.action, act.action_input, state.steps
+                    )
                 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                     results = list(executor.map(run_action, model_step.actions))

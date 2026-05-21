@@ -82,6 +82,9 @@ _ZERO_EXCLUSION_ALLOWED_PATTERN = re.compile(
 
 _ZERO_FILTER_PATTERN = re.compile(r">\s*0(?:\.0+)?\b", flags=re.IGNORECASE)
 
+_COST_METRIC_PATTERN = re.compile(r"\bcost\b", flags=re.IGNORECASE)
+_AMOUNT_COLUMN_PATTERN = re.compile(r"\bamount\b", flags=re.IGNORECASE)
+
 
 def _normalize(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
@@ -158,6 +161,54 @@ def validate_answer(
             "The aggregate query filters values with `> 0`, but the question does not ask to "
             "exclude zero/positive-only values. Keep zero values in the aggregate; only drop "
             "blanks/nulls via casting (e.g. TRY_CAST/NULLIF) if needed."
+        )
+
+    # 3) Minmax question returns multiple tied rows but the question has no "list all" / "tally"
+    # phrasing that would justify a multi-row answer. Fires only when answer has >1 entity row
+    # and no LIMIT 1 was used. This avoids breaking list-all / tally tasks (those skip via
+    # asks_list_all / asks_tally) and numeric aggregate tasks (those have helper col in answer).
+    _LIMIT_ONE_PATTERN = re.compile(r"\blimit\s+1\b", flags=re.IGNORECASE)
+    if (
+        asks_minmax
+        and not asks_list_all
+        and not asks_tally
+        and not wants_extra
+        and len(columns) == 1
+        and not _is_helper_column(columns[0])
+        and len(rows) > 1
+        and history
+        and not _LIMIT_ONE_PATTERN.search(history)
+    ):
+        issues.append(
+            "The question has a min/max intent but does not ask to 'list all' or 'tally'. "
+            "Return exactly one row using TWO sort keys for deterministic tie-breaking: "
+            "ORDER BY metric_column ASC, entity_name_column ASC LIMIT 1. "
+            "Example: if returning event_name ordered by cost, use "
+            "`ORDER BY ex.cost ASC, e.event_name ASC LIMIT 1`. "
+            "Do NOT order by the metric alone (tied values give a non-deterministic result). "
+            "Do NOT return all tied rows."
+        )
+
+    # 4) Minmax "cost" question where agent queried `amount` without a `cost` column.
+    # Fires only when: (a) question has minmax+cost, (b) answer is a single entity column,
+    # (c) history shows `amount` used but no `cost` column referenced. Prefer false negatives:
+    # the `and history` guard ensures we don't fire when there are no recorded queries.
+    if (
+        asks_minmax
+        and _COST_METRIC_PATTERN.search(q)
+        and len(columns) == 1
+        and not _is_helper_column(columns[0])
+        and rows
+        and history
+        and _AMOUNT_COLUMN_PATTERN.search(history)
+        and not _COST_METRIC_PATTERN.search(history)
+    ):
+        issues.append(
+            "The question asks for 'cost', but your queries reference `amount` without "
+            "using a column literally named `cost`. Check whether there is a separate "
+            "table (e.g., an expense or transaction table) that has a `cost` column — "
+            "use that for the min/max lookup. Only fall back to `amount` if no `cost` "
+            "column exists in the database."
         )
 
     return issues

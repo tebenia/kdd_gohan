@@ -38,6 +38,7 @@ class RunConfig:
     max_workers: int = 4
     difficulty_max_workers: dict[str, int] = field(default_factory=lambda: {"hard": 1})
     task_timeout_seconds: int = 600
+    retry_failed_once: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +83,16 @@ def _difficulty_worker_overrides(raw_value: object, default_value: dict[str, int
     return overrides
 
 
+def _bool_value(raw_value: object, default_value: bool) -> bool:
+    if raw_value is None:
+        return default_value
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, int):
+        return raw_value != 0
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def load_app_config(config_path: Path) -> AppConfig:
     payload = yaml.safe_load(config_path.read_text()) or {}
     dataset_defaults = DatasetConfig()
@@ -120,6 +131,10 @@ def load_app_config(config_path: Path) -> AppConfig:
         ),
         task_timeout_seconds=int(
             run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)
+        ),
+        retry_failed_once=_bool_value(
+            run_payload.get("retry_failed_once"),
+            run_defaults.retry_failed_once,
         ),
     )
     return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config)

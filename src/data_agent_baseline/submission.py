@@ -38,6 +38,7 @@ class SubmissionConfig:
     difficulty_max_workers: dict[str, int]
     task_timeout_seconds: int
     write_traces: bool
+    retry_failed_once: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,7 @@ def load_submission_config() -> SubmissionConfig:
         difficulty_max_workers=_difficulty_worker_overrides(),
         task_timeout_seconds=_env_int("SUBMISSION_TASK_TIMEOUT_SECONDS", 600),
         write_traces=_env_bool("SUBMISSION_WRITE_TRACES", False),
+        retry_failed_once=_env_bool("SUBMISSION_RETRY_FAILED_ONCE", True),
     )
 
 
@@ -319,9 +321,25 @@ def process_task(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResu
         args=(task_dir.as_posix(), config, queue),
     )
     process.start()
-    process.join(timeout_seconds)
+    deadline = perf_counter() + timeout_seconds
+    payload: dict[str, Any] | None = None
 
-    if process.is_alive():
+    while True:
+        remaining_seconds = deadline - perf_counter()
+        if remaining_seconds <= 0:
+            break
+        try:
+            payload = queue.get(timeout=min(1.0, remaining_seconds))
+            break
+        except Empty:
+            if not process.is_alive():
+                break
+
+    if payload is not None:
+        process.join(timeout=1.0)
+        if process.is_alive():
+            terminate_task_process(process)
+    elif process.is_alive():
         terminate_task_process(process)
         failure_reason = f"Task timed out after {timeout_seconds} seconds."
         prediction_path = write_empty_prediction(config.output_root, task_id)
@@ -338,10 +356,16 @@ def process_task(task_dir: Path, config: SubmissionConfig) -> SubmissionTaskResu
             failure_reason=failure_reason,
             trace_path=str(trace_path) if trace_path is not None else None,
         )
+    else:
+        process.join()
 
-    try:
-        payload = queue.get(timeout=1.0)
-    except Empty:
+    if payload is None:
+        try:
+            payload = queue.get(timeout=0.1)
+        except Empty:
+            payload = None
+
+    if payload is None:
         failure_reason = f"Task exited without returning a result (exit_code={process.exitcode})."
         prediction_path = write_empty_prediction(config.output_root, task_id)
         trace_path = (
@@ -417,7 +441,8 @@ def run_submission(config: SubmissionConfig) -> int:
         f"Starting submission run input={config.input_root} output={config.output_root} "
         f"model={config.model_name} max_steps={config.max_steps} "
         f"max_workers={config.max_workers} difficulty_max_workers={config.difficulty_max_workers} "
-        f"task_timeout_seconds={config.task_timeout_seconds} write_traces={config.write_traces}",
+        f"task_timeout_seconds={config.task_timeout_seconds} write_traces={config.write_traces} "
+        f"retry_failed_once={config.retry_failed_once}",
         flush=True,
     )
     task_dirs = iter_task_dirs(config.input_root)
@@ -435,6 +460,30 @@ def run_submission(config: SubmissionConfig) -> int:
             _process_task_group(grouped_task_dirs[max_workers], max_workers=max_workers, config=config)
         )
 
+    retried_task_ids: list[str] = []
+    if config.retry_failed_once and not STOP_REQUESTED and any(
+        max_workers > 1 for max_workers in grouped_task_dirs
+    ):
+        task_dir_by_id = {task_dir.name: task_dir for task_dir in task_dirs}
+        result_by_id = {result.task_id: result for result in results}
+        failed_results = [result for result in results if not result.succeeded]
+        if failed_results:
+            print(
+                f"Retrying {len(failed_results)} failed tasks sequentially with max_workers=1.",
+                flush=True,
+            )
+        for failed_result in failed_results:
+            if STOP_REQUESTED:
+                break
+            task_dir = task_dir_by_id.get(failed_result.task_id)
+            if task_dir is None:
+                continue
+            retry_result = process_task(task_dir, config)
+            result_by_id[retry_result.task_id] = retry_result
+            retried_task_ids.append(retry_result.task_id)
+            _print_task_result(retry_result)
+        results = list(result_by_id.values())
+
     results.sort(key=lambda item: (task_number(item.task_id), item.task_id))
     summary = {
         "task_count": len(task_dirs),
@@ -445,6 +494,8 @@ def run_submission(config: SubmissionConfig) -> int:
         "default_max_workers": config.max_workers,
         "difficulty_max_workers": config.difficulty_max_workers,
         "write_traces": config.write_traces,
+        "retry_failed_once": config.retry_failed_once,
+        "retried_task_ids": retried_task_ids,
         "worker_group_counts": {
             str(max_workers): len(grouped_task_dirs[max_workers])
             for max_workers in sorted(grouped_task_dirs, reverse=True)

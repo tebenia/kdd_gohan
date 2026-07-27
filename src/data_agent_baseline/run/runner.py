@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing
+from queue import Empty
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -129,28 +130,54 @@ def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multi
         )
 
 
-def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
-    timeout_seconds = config.run.task_timeout_seconds
-    if timeout_seconds <= 0:
-        return _run_single_task_core(task_id=task_id, config=config)
-
-    queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
-    process = multiprocessing.Process(
-        target=_run_single_task_in_subprocess,
-        args=(task_id, config, queue),
-    )
-    process.start()
-    process.join(timeout_seconds)
-
+def _terminate_run_process(process: multiprocessing.Process) -> None:
     if process.is_alive():
         process.terminate()
         process.join(timeout=1.0)
         if process.is_alive():
             process.kill()
             process.join()
-        return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
 
-    if queue.empty():
+
+def _attempt_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
+    timeout_seconds = config.run.task_timeout_seconds
+    result_queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
+    process = multiprocessing.Process(
+        target=_run_single_task_in_subprocess,
+        args=(task_id, config, result_queue),
+    )
+    process.start()
+    deadline = perf_counter() + timeout_seconds
+    result: dict[str, Any] | None = None
+
+    while True:
+        remaining_seconds = deadline - perf_counter()
+        if remaining_seconds <= 0:
+            break
+        try:
+            result = result_queue.get(timeout=min(1.0, remaining_seconds))
+            break
+        except Empty:
+            if not process.is_alive():
+                break
+
+    if result is not None:
+        process.join(timeout=1.0)
+        if process.is_alive():
+            _terminate_run_process(process)
+    elif process.is_alive():
+        _terminate_run_process(process)
+        return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
+    else:
+        process.join()
+
+    if result is None:
+        try:
+            result = result_queue.get(timeout=0.1)
+        except Empty:
+            result = None
+
+    if result is None:
         exit_code = process.exitcode
         if exit_code not in (None, 0):
             return _failure_run_result_payload(
@@ -159,10 +186,21 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             )
         return _failure_run_result_payload(task_id, "Task exited without returning a result.")
 
-    result = queue.get()
     if result.get("ok"):
         return dict(result["run_result"])
     return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}")
+
+
+def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
+    if config.run.task_timeout_seconds <= 0:
+        return _run_single_task_core(task_id=task_id, config=config)
+
+    result = _attempt_single_task_with_timeout(task_id=task_id, config=config)
+    steps = result.get("steps", [])
+    failure = str(result.get("failure_reason") or "")
+    if len(steps) == 0 and "timed out" in failure:
+        result = _attempt_single_task_with_timeout(task_id=task_id, config=config)
+    return result
 
 
 def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str, Any]) -> TaskRunArtifacts:
@@ -319,6 +357,28 @@ def run_benchmark(
             )
         task_artifacts = [artifact for artifact in indexed_artifacts if artifact is not None]
 
+    if (
+        config.run.retry_failed_once
+        and effective_workers > 1
+        and model is None
+        and tools is None
+    ):
+        failed_artifacts = [artifact for artifact in task_artifacts if not artifact.succeeded]
+        if failed_artifacts:
+            artifact_map = {artifact.task_id: artifact for artifact in task_artifacts}
+            for failed_artifact in failed_artifacts:
+                retry_artifact = run_single_task(
+                    task_id=failed_artifact.task_id,
+                    config=config,
+                    run_output_dir=run_output_dir,
+                )
+                artifact_map[failed_artifact.task_id] = retry_artifact
+            task_artifacts = [
+                artifact_map[task_id]
+                for task_id in task_ids
+                if task_id in artifact_map
+            ]
+
     summary_path = run_output_dir / "summary.json"
     _write_json(
         summary_path,
@@ -329,6 +389,7 @@ def run_benchmark(
             "max_workers": effective_workers,
             "default_max_workers": config.run.max_workers,
             "difficulty_max_workers": config.run.difficulty_max_workers,
+            "retry_failed_once": config.run.retry_failed_once,
             "tasks": [artifact.to_dict() for artifact in task_artifacts],
         },
     )

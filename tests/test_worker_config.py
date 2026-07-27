@@ -45,6 +45,7 @@ run:
 
         self.assertEqual(config.run.max_workers, 4)
         self.assertEqual(config.run.difficulty_max_workers, {"hard": 1})
+        self.assertTrue(config.run.retry_failed_once)
 
     def test_local_config_uses_difficulty_worker_overrides(self) -> None:
         config = AppConfig(
@@ -71,6 +72,7 @@ run:
         self.assertEqual(config.max_workers, 4)
         self.assertEqual(config.difficulty_max_workers, {"hard": 1})
         self.assertFalse(config.write_traces)
+        self.assertTrue(config.retry_failed_once)
 
     def test_submission_config_env_overrides_difficulty_workers(self) -> None:
         with patch.dict(
@@ -82,6 +84,7 @@ run:
                 "SUBMISSION_MEDIUM_MAX_WORKERS": "4",
                 "SUBMISSION_HARD_MAX_WORKERS": "2",
                 "SUBMISSION_WRITE_TRACES": "true",
+                "SUBMISSION_RETRY_FAILED_ONCE": "false",
             },
             clear=True,
         ):
@@ -93,6 +96,7 @@ run:
             {"easy": 5, "medium": 4, "hard": 2},
         )
         self.assertTrue(config.write_traces)
+        self.assertFalse(config.retry_failed_once)
 
     def test_submission_task_worker_count_uses_task_difficulty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -113,6 +117,7 @@ run:
                 difficulty_max_workers={"hard": 1},
                 task_timeout_seconds=1,
                 write_traces=False,
+                retry_failed_once=True,
             )
 
             self.assertEqual(task_worker_count(easy_dir, config), 4)

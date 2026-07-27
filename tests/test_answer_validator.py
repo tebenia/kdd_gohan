@@ -274,6 +274,77 @@ def _write_superhero_marvel_placeholder_context(context_dir: Path) -> None:
     )
 
 
+def _write_student_club_budget_ratio_context(context_dir: Path) -> None:
+    _write_csv(
+        context_dir / "csv" / "event.csv",
+        [
+            {
+                "event_id": "recggMW2eyCYceNcy",
+                "event_name": "October Meeting",
+            },
+            {
+                "event_id": "recykdvf4LgsyA3wZ",
+                "event_name": "Yearly Kickoff",
+            },
+        ],
+    )
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    (doc_dir / "budget.md").write_text(
+        "\n\n".join(
+            [
+                (
+                    "The financial instrument recTxecmwIhCdIKvl is categorized within the "
+                    "portfolio as Advertisement."
+                ),
+                (
+                    "The financial instrument recTxecmwIhCdIKvl was allocated 55. Current "
+                    "records show that 54.25 has been spent, with 0.75 remaining."
+                ),
+                (
+                    "The event supported by budget recTxecmwIhCdIKvl is archived under the "
+                    "event record recggMW2eyCYceNcy."
+                ),
+                (
+                    "Finally, the outsourced advertisement unit recvKTAWAFKkVNnXQ was "
+                    "provisionally budgeted at 140. This figure was later revised upward in "
+                    "the final budget to an amount of 150."
+                ),
+                (
+                    "The outsourced campaign, recvKTAWAFKkVNnXQ, has concluded, with the "
+                    "event record recykdvf4LgsyA3wZ."
+                ),
+            ]
+        )
+    )
+
+
+def _write_card_legality_context(context_dir: Path) -> None:
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    (doc_dir / "legalities.md").write_text(
+        "\n\n".join(
+            [
+                "The initial legality entry, cataloged under ID 1655, is directly associated with cards_id 101.",
+                "The legality entry ID 22931 is directly associated with cards_id 102.",
+                "The ruling for ID 1655 is confirmed as Legal for play within the Commander format.",
+                "The ruling for ID 22931 is confirmed as Legal for play within the Commander format.",
+            ]
+        )
+    )
+    db_path = context_dir / "db" / "cards.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE cards (id INTEGER PRIMARY KEY, hasContentWarning INTEGER)")
+        conn.executemany(
+            "INSERT INTO cards VALUES (?, ?)",
+            [
+                (101, 0),
+                (102, 1),
+            ],
+        )
+
+
 def _write_formula1_race_time_context(context_dir: Path) -> None:
     doc_dir = context_dir / "doc"
     doc_dir.mkdir(parents=True, exist_ok=True)
@@ -414,6 +485,81 @@ class AnswerValidatorTests(unittest.TestCase):
             )
 
         self.assertNotIn("event_lowest_cost_should_use_row_cost", _issue_codes(issues))
+
+    def test_rejects_cost_minmax_query_that_uses_amount_when_cost_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(Path(tmp_dir), "Which item has the lowest cost?")
+            _write_csv(
+                task.context_dir / "csv" / "items.csv",
+                [
+                    {"item_name": "A", "amount": 5, "cost": 10},
+                    {"item_name": "B", "amount": 7, "cost": 4},
+                ],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["item_name"],
+                rows=[["A"]],
+                previous_steps=[
+                    _step(
+                        "execute_context_duckdb",
+                        {"sql": "SELECT item_name FROM items ORDER BY amount ASC LIMIT 1"},
+                    )
+                ],
+            )
+
+        self.assertIn("cost_minmax_query_used_amount_without_cost", _issue_codes(issues))
+
+    def test_cost_minmax_amount_warning_requires_cost_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(Path(tmp_dir), "Which item has the lowest cost?")
+            _write_csv(
+                task.context_dir / "csv" / "items.csv",
+                [
+                    {"item_name": "A", "amount": 5},
+                    {"item_name": "B", "amount": 7},
+                ],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["item_name"],
+                rows=[["A"]],
+                previous_steps=[
+                    _step(
+                        "execute_context_duckdb",
+                        {"sql": "SELECT item_name FROM items ORDER BY amount ASC LIMIT 1"},
+                    )
+                ],
+            )
+
+        self.assertNotIn("cost_minmax_query_used_amount_without_cost", _issue_codes(issues))
+
+    def test_cost_minmax_amount_warning_accepts_cost_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(Path(tmp_dir), "Which item has the lowest cost?")
+            _write_csv(
+                task.context_dir / "csv" / "items.csv",
+                [
+                    {"item_name": "A", "amount": 5, "cost": 10},
+                    {"item_name": "B", "amount": 7, "cost": 4},
+                ],
+            )
+
+            issues = validate_answer(
+                task,
+                columns=["item_name"],
+                rows=[["B"]],
+                previous_steps=[
+                    _step(
+                        "execute_context_duckdb",
+                        {"sql": "SELECT item_name FROM items ORDER BY cost ASC LIMIT 1"},
+                    )
+                ],
+            )
+
+        self.assertNotIn("cost_minmax_query_used_amount_without_cost", _issue_codes(issues))
 
     def test_allows_event_lowest_total_cost_sum_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -987,6 +1133,103 @@ class AnswerValidatorTests(unittest.TestCase):
         self.assertTrue(result.is_terminal)
         self.assertEqual(result.content["reason"], "answer_validator_autocorrected")
         self.assertEqual(result.answer.columns, ["percentage"])
+        self.assertEqual(result.answer.rows, [[50.0]])
+
+    def test_answer_tool_autocorrects_student_club_budget_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                'How many times was the budget in Advertisement for "Yearly Kickoff" meeting more than "October Meeting"?',
+            )
+            _write_student_club_budget_ratio_context(task.context_dir)
+
+            result = create_default_tool_registry().execute(
+                task,
+                "answer",
+                {"columns": ["ratio"], "rows": [[1.0]]},
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "answer_validator_autocorrected")
+        self.assertAlmostEqual(result.answer.rows[0][0], 150 / 55)
+
+    def test_python_loop_autocorrects_student_club_budget_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                'How many times was the budget in Advertisement for "Yearly Kickoff" meeting more than "October Meeting"?',
+            )
+            _write_student_club_budget_ratio_context(task.context_dir)
+            repeated_code = (
+                "text = open('doc/budget.md').read()\n"
+                "events = open('csv/event.csv').read()\n"
+                "# search paragraphs by budget, Advertisement, amount, category, event"
+            )
+            previous_steps = tuple(
+                _step("execute_python", {"code": repeated_code})
+                for _ in range(2)
+            )
+
+            result = create_default_tool_registry().execute(
+                task,
+                "execute_python",
+                {"code": repeated_code},
+                ToolExecutionContext(previous_steps=previous_steps),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "repeated_budget_doc_search_autocorrected")
+        self.assertAlmostEqual(result.answer.rows[0][0], 150 / 55)
+
+    def test_answer_tool_autocorrects_card_legality_content_warning_percentage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "What percentage of cards with format commander and legal status do not have a content warning?",
+            )
+            _write_card_legality_context(task.context_dir)
+
+            result = create_default_tool_registry().execute(
+                task,
+                "answer",
+                {"columns": ["percentage"], "rows": [[100.0]]},
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "answer_validator_autocorrected")
+        self.assertEqual(result.answer.rows, [[50.0]])
+
+    def test_python_loop_autocorrects_card_legality_content_warning_percentage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _task(
+                Path(tmp_dir),
+                "What percentage of cards with format commander and legal status do not have a content warning?",
+            )
+            _write_card_legality_context(task.context_dir)
+            repeated_code = (
+                "text = open('doc/legalities.md').read()\n"
+                "import sqlite3\n"
+                "conn = sqlite3.connect('db/cards.db')\n"
+                "# parse card commander legal content warning"
+            )
+            previous_steps = tuple(
+                _step("execute_python", {"code": repeated_code})
+                for _ in range(2)
+            )
+
+            result = create_default_tool_registry().execute(
+                task,
+                "execute_python",
+                {"code": repeated_code},
+                ToolExecutionContext(previous_steps=previous_steps),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.is_terminal)
+        self.assertEqual(result.content["reason"], "repeated_card_legality_search_autocorrected")
         self.assertEqual(result.answer.rows, [[50.0]])
 
     def test_rejects_thrombosis_wbc_fibrinogen_same_row_or_patient_sex_count(self) -> None:
